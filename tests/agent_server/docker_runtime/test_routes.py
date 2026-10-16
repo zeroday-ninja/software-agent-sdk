@@ -27,6 +27,8 @@ from openhands.agent_server.docker_runtime.routers import (
 )
 from openhands.agent_server.event_router import event_read_router
 from openhands.agent_server.models import UpdateSecretsRequest
+from openhands.agent_server.persistence import get_secrets_store
+from openhands.sdk.agent.acp_file_credentials import CODEX_AUTH_SECRET_NAME
 from openhands.sdk.profiles.agent_profile import LaunchedAgentProfile
 from openhands.sdk.secret import LookupSecret
 
@@ -301,6 +303,15 @@ def test_docker_event_history_reads_persistence_without_starting_a_container(
     registry.get_or_create.assert_not_awaited()
 
 
+def _codex_login(last_refresh: str) -> str:
+    return json.dumps(
+        {
+            "last_refresh": last_refresh,
+            "tokens": {"refresh_token": f"r-{last_refresh}", "account_id": "acct-1"},
+        }
+    )
+
+
 def test_delete_stops_runtime_before_removing_outer_owned_state(tmp_path, monkeypatch):
     monkeypatch.setenv("OH_PERSISTENCE_DIR", str(tmp_path / "persistence"))
     config = Config(
@@ -316,6 +327,12 @@ def test_delete_stops_runtime_before_removing_outer_owned_state(tmp_path, monkey
     runtime_dir = registry.provisioning.runtime_dir(conversation_id)
     (runtime_dir / "persistence").mkdir()
     registry.stop = AsyncMock()
+    # The sandbox refreshed the Codex login; its copy is the only valid one.
+    store = get_secrets_store(config)
+    store.set_secret(CODEX_AUTH_SECRET_NAME, _codex_login("2026-10-15T00:00:00Z"))
+    refreshed = _codex_login("2026-10-15T01:00:00Z")
+    (conversation_dir / "acp" / "codex").mkdir(parents=True)
+    (conversation_dir / "acp" / "codex" / "auth.json").write_text(refreshed)
 
     app = FastAPI()
     app.state.conversation_registry = registry
@@ -331,6 +348,7 @@ def test_delete_stops_runtime_before_removing_outer_owned_state(tmp_path, monkey
     )
     assert not conversation_dir.exists()
     assert not runtime_dir.exists()
+    assert store.get_secret(CODEX_AUTH_SECRET_NAME) == refreshed
 
 
 @pytest.mark.asyncio

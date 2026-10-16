@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import secrets
+import shutil
 import subprocess
+import tempfile
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
@@ -25,7 +28,10 @@ from openhands.agent_server.models import (
     ConversationRuntimeInfo,
     ConversationRuntimeStatus,
 )
-from openhands.agent_server.persistence.store import _get_persistence_dir
+from openhands.agent_server.persistence.store import (
+    FileSecretsStore,
+    _get_persistence_dir,
+)
 from openhands.agent_server.storage import Reclaimer
 from openhands.sdk.conversation.state import ConversationExecutionStatus
 from openhands.sdk.logger import get_logger
@@ -69,6 +75,17 @@ class ConversationContainer:
             ["docker", "inspect", "-f", "{{.State.Running}}", self.container_id]
         )
         return result.returncode == 0 and result.stdout.strip() == "true"
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryRuntime:
+    """A running throwaway sandbox, the cipher its server decrypts with, and
+    its own secret store (credentials that refresh in the sandbox land there).
+    """
+
+    container: ConversationContainer
+    cipher: Cipher
+    secrets_store: FileSecretsStore
 
 
 class DockerConversationRegistry(ConversationRegistry):
@@ -407,7 +424,70 @@ class DockerConversationRegistry(ConversationRegistry):
         workspace_dir = self.workspace_dir(conversation_id)
         for directory in (persistence_dir, conversation_dir, workspace_dir):
             directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        return self._run_container(
+            api_key=identity.api_key.get_secret_value(),
+            encryption_key=identity.encryption_key.get_secret_value(),
+            launched_profile=(
+                identity.launched_agent_profile.model_dump_json()
+                if identity.launched_agent_profile
+                else ""
+            ),
+            mounts=(
+                (conversation_dir, f"{_CONVERSATIONS_DIR}/{conversation_id.hex}"),
+                (persistence_dir, _PERSISTENCE_DIR),
+                (workspace_dir, _WORKSPACE_DIR),
+            ),
+        )
 
+    @asynccontextmanager
+    async def discovery_runtime(self) -> AsyncIterator[DiscoveryRuntime]:
+        """Run a throwaway sandbox from the conversation image.
+
+        For work that must happen where conversations run -- ACP model
+        discovery uses the image's ACP servers and credentials handling --
+        without provisioning a conversation. The container and its scratch
+        directories are removed on exit; its keys are never persisted.
+        """
+        root = Path(tempfile.mkdtemp(prefix="oh-acp-discovery-"))
+        try:
+            mounts: list[tuple[Path, str]] = []
+            for name, target in (
+                ("conversations", _CONVERSATIONS_DIR),
+                ("persistence", _PERSISTENCE_DIR),
+                ("workspace", _WORKSPACE_DIR),
+            ):
+                directory = root / name
+                directory.mkdir(mode=0o700)
+                mounts.append((directory, target))
+            encryption_key = secrets.token_urlsafe(32)
+            cipher = Cipher(encryption_key)
+            container = await asyncio.to_thread(
+                self._run_container,
+                api_key=secrets.token_urlsafe(32),
+                encryption_key=encryption_key,
+                launched_profile="",
+                mounts=tuple(mounts),
+            )
+            try:
+                yield DiscoveryRuntime(
+                    container=container,
+                    cipher=cipher,
+                    # The store the sandbox server opens at OH_PERSISTENCE_DIR.
+                    secrets_store=FileSecretsStore(root / "persistence", cipher),
+                )
+            finally:
+                await asyncio.to_thread(container.stop)
+        finally:
+            await asyncio.to_thread(shutil.rmtree, root, True)
+
+    def _run_container(
+        self,
+        *,
+        api_key: str,
+        encryption_key: str,
+        launched_profile: str,
+        mounts: tuple[tuple[Path, str], ...],
+    ) -> ConversationContainer:
         env = sanitized_env()
         env.update(
             {
@@ -418,13 +498,9 @@ class DockerConversationRegistry(ConversationRegistry):
                 "OH_ENABLE_BROWSER": (
                     "1" if container_browser_enabled(self.config) else "0"
                 ),
-                "OH_SECRET_KEY": identity.encryption_key.get_secret_value(),
-                V1_SESSION_API_KEY_ENV: identity.api_key.get_secret_value(),
-                "OH_RUNTIME_LAUNCHED_PROFILE": (
-                    identity.launched_agent_profile.model_dump_json()
-                    if identity.launched_agent_profile
-                    else ""
-                ),
+                "OH_SECRET_KEY": encryption_key,
+                V1_SESSION_API_KEY_ENV: api_key,
+                "OH_RUNTIME_LAUNCHED_PROFILE": launched_profile,
             }
         )
         if "DEBUG" in os.environ:
@@ -444,11 +520,7 @@ class DockerConversationRegistry(ConversationRegistry):
         ):
             if name in env:
                 flags.extend(("-e", name))
-        for host, target in (
-            (conversation_dir, f"{_CONVERSATIONS_DIR}/{conversation_id.hex}"),
-            (persistence_dir, _PERSISTENCE_DIR),
-            (workspace_dir, _WORKSPACE_DIR),
-        ):
+        for host, target in mounts:
             flags.extend(("-v", f"{host}:{target}"))
         if self.config.conversation_container_memory:
             flags.extend(("--memory", self.config.conversation_container_memory))
@@ -502,7 +574,7 @@ class DockerConversationRegistry(ConversationRegistry):
                 raise RuntimeError("Docker did not create a loopback port binding")
             container = ConversationContainer(
                 host=f"http://127.0.0.1:{int(port)}",
-                api_key=identity.api_key.get_secret_value(),
+                api_key=api_key,
                 container_id=container_id,
             )
             self._wait_until_ready(container)

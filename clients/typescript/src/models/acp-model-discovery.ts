@@ -21,6 +21,15 @@ export interface ACPModelDiscovery {
   current_model_id: string | null;
   available_models: ACPModelInfo[];
   supports_runtime_model_switch: boolean;
+  /** Reasoning-effort level the server picks for `current_model_id`; `null` when it has no effort option. */
+  current_effort?: string | null;
+  /** Effort levels the server offers for `current_model_id`. */
+  available_efforts?: string[];
+  /**
+   * Effort levels per `available_models` id (a model without effort levels maps to `[]`).
+   * Select one with a combined `<model>/<effort>` model id. Absent on older servers.
+   */
+  efforts_by_model?: Record<string, string[]>;
   error: ACPModelDiscoveryError | null;
 }
 

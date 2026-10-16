@@ -102,8 +102,8 @@ class ACPInstallSpec:
 # edit needed — ACP_PROVIDERS, the Dockerfile install stage, and the
 # TypeScript mirror (via check-acp-drift.py --write) all derive from
 # ACP_INSTALL_CATALOG below.
-CLAUDE_AGENT_ACP_VERSION = "0.63.0"
-CODEX_ACP_VERSION = "1.10.0"
+CLAUDE_AGENT_ACP_VERSION = "0.91.0"
+CODEX_ACP_VERSION = "2.2.2"
 GEMINI_CLI_VERSION = "0.46.0"
 KIMI_CODE_VERSION = "0.38.0"
 
@@ -124,6 +124,8 @@ ACP_INSTALL_CATALOG: Mapping[str, ACPInstallSpec] = {
             ),
         ),
         binary_name="claude-agent-acp",
+        # claude-agent-acp declares ``engines.node: >=22`` since 0.8x.
+        min_node_version="22.0.0",
     ),
     "codex": ACPInstallSpec(
         key="codex",

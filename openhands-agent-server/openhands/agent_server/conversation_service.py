@@ -335,6 +335,15 @@ def _compose_conversation_info(
     supports_runtime_model_switch = bool(
         agent_state.get("acp_supports_runtime_model_switch", False)
     )
+    # Effort levels depend on the model, so a live agent is authoritative even
+    # when it reports none (e.g. after switching to a model without levels);
+    # only cold reads fall back to the persisted snapshot.
+    if agent_initialized:
+        current_effort = getattr(agent, "current_effort", None)
+        available_efforts = list(getattr(agent, "available_efforts", None) or [])
+    else:
+        current_effort = agent_state.get("acp_current_effort")
+        available_efforts = list(agent_state.get("acp_available_efforts") or [])
     return ConversationInfo(
         **state.model_dump(mode="json"),
         title=stored.title,
@@ -348,6 +357,8 @@ def _compose_conversation_info(
         current_model_id=current_model_id,
         available_models=available_models,
         supports_runtime_model_switch=supports_runtime_model_switch,
+        current_effort=current_effort,
+        available_efforts=available_efforts,
         client_tools=stored.client_tools,
         tool_module_qualnames=dict(stored.tool_module_qualnames),
         launched_agent_profile=stored.launched_agent_profile,
