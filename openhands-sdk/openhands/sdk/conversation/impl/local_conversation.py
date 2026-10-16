@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePath
 from typing import Any, Final, TypeGuard, cast
 
-from openhands.sdk.agent.acp_agent import ACPAgent
+from openhands.sdk.agent.acp_agent import ACPAgent, merge_agent_state
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.agent.stream_context import StreamProgressCallbackType
 from openhands.sdk.context.condenser import CondenserBase, LLMSummarizingCondenser
@@ -1814,10 +1814,16 @@ class LocalConversation(BaseConversation):
             # Write unconditionally: a successful switch is authoritative even
             # for an older/custom server that reported no ``models`` at init
             # (so the key may not exist yet).
-            self._state.agent_state = {
+            agent_state = {
                 **self._state.agent_state,
                 "acp_current_model_id": model,
             }
+            # The switch may change the effort levels on offer (they depend on
+            # the model); keep their persisted snapshot in step as well.
+            effort_state = new_agent.effort_agent_state()
+            if effort_state is not None:
+                merge_agent_state(agent_state, effort_state)
+            self._state.agent_state = agent_state
 
     @observe(name="conversation.send_message")
     def send_message(self, message: str | Message, sender: str | None = None) -> None:

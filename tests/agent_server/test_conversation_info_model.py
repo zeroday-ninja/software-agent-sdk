@@ -353,3 +353,38 @@ def test_supports_runtime_model_switch_defaults_false():
     info = _compose_conversation_info(stored, state)
 
     assert info.supports_runtime_model_switch is False
+
+
+def test_effort_fields_read_from_persisted_agent_state_on_cold_read():
+    """Before ``init_state`` fires, effort state comes from the persisted snapshot."""
+    agent = ACPAgent(acp_command=["echo", "test"], acp_model="opus/high")
+    state = _make_state(agent)
+    state.agent_state = {
+        "acp_current_effort": "high",
+        "acp_available_efforts": ["low", "high", "max"],
+    }
+    stored = _make_stored(state)
+
+    info = _compose_conversation_info(stored, state)
+
+    assert info.current_effort == "high"
+    assert info.available_efforts == ["low", "high", "max"]
+
+
+def test_live_agent_without_effort_levels_ignores_the_persisted_snapshot():
+    """Effort levels follow the model: after a live switch to a model without
+    levels the stale snapshot from the previous model must not resurface."""
+    agent = ACPAgent(acp_command=["echo", "test"])
+    agent._initialized = True
+    agent._current_effort = None
+    agent._available_efforts = []
+    state = _make_state(agent)
+    state.agent_state = {
+        "acp_current_effort": "high",
+        "acp_available_efforts": ["low", "high"],
+    }
+    stored = _make_stored(state)
+
+    info = _compose_conversation_info(stored, state)
+
+    assert (info.current_effort, info.available_efforts) == (None, [])

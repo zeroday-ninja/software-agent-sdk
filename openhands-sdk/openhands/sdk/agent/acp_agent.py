@@ -32,6 +32,8 @@ from collections.abc import (
     Callable,
     Collection,
     Generator,
+    Iterable,
+    Mapping,
     Sequence,
 )
 from concurrent.futures import Future
@@ -88,6 +90,7 @@ from pydantic import (
 
 from openhands.sdk.agent.acp_contracts import (
     ACPLegacySessionModels,
+    extract_session_efforts,
     extract_session_models,
     is_model_dumpable,
     normalize_acp_error,
@@ -578,29 +581,63 @@ def _with_codex_base_url(
 # (codex-acp, claude-agent-acp 0.44+) rather than the UNSTABLE ``models``
 # capability + ``session/set_model`` (gemini-cli, older codex/claude).
 _MODEL_CONFIG_OPTION_ID = "model"
-_CODEX_REASONING_EFFORTS: Final[frozenset[str]] = frozenset(
-    {"low", "medium", "high", "xhigh"}
+# Effort select id per built-in provider, used before a session reports its own
+# (codex-acp ``reasoning_effort``, claude-agent-acp ``effort``).
+_PROVIDER_EFFORT_CONFIG_IDS: Final[dict[str, str]] = {
+    "codex": "reasoning_effort",
+    "claude-code": "effort",
+}
+# Effort levels accepted in a combined ``<model>/<effort>`` id before a session
+# reports its own list; levels a session advertises are always accepted too.
+_KNOWN_EFFORT_LEVELS: Final[frozenset[str]] = frozenset(
+    {"default", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 )
 
 
-def _codex_model_config_options(model: str) -> tuple[tuple[str, str], ...]:
-    """Map combined Canvas Codex model IDs to codex-acp config options."""
-    base_model, sep, effort = model.rpartition("/")
-    if sep and base_model and effort in _CODEX_REASONING_EFFORTS:
-        return (
-            (_MODEL_CONFIG_OPTION_ID, base_model),
-            ("reasoning_effort", effort),
-        )
-    return ((_MODEL_CONFIG_OPTION_ID, model),)
+_EFFORT_AGENT_STATE_KEYS: Final[tuple[str, ...]] = (
+    "acp_available_efforts",
+    "acp_current_effort",
+    "acp_effort_config_id",
+)
+
+
+def merge_agent_state(agent_state: dict[str, Any], updates: Mapping[str, Any]) -> None:
+    """Apply ``updates`` to ``agent_state``, removing keys whose value is ``None``."""
+    for key, value in updates.items():
+        if value is None:
+            agent_state.pop(key, None)
+        else:
+            agent_state[key] = value
 
 
 def _model_config_options(
     agent_name: str | None,
     model: str,
+    *,
+    effort_config_id: str | None = None,
+    efforts: Iterable[str] = (),
 ) -> tuple[tuple[str, str], ...]:
-    provider = detect_acp_provider_by_agent_name(agent_name or "")
-    if provider is not None and provider.key == "codex":
-        return _codex_model_config_options(model)
+    """Map an ``acp_model`` id to ``set_config_option`` calls.
+
+    A combined id ``<model>/<effort>`` (``gpt-5.5/high``, ``opus/max``) selects
+    the model and then the server's reasoning-effort option, because ACP
+    servers expose effort as a separate config option. ``effort_config_id`` and
+    ``efforts`` come from the live session when it reported them; otherwise the
+    provider's known effort option and :data:`_KNOWN_EFFORT_LEVELS` apply. Ids
+    whose last segment is not an effort level (``custom/provider/model``) are
+    passed through unchanged.
+    """
+    if effort_config_id is None:
+        provider = detect_acp_provider_by_agent_name(agent_name or "")
+        if provider is not None:
+            effort_config_id = _PROVIDER_EFFORT_CONFIG_IDS.get(provider.key)
+    if effort_config_id is not None:
+        base_model, sep, effort = model.rpartition("/")
+        if sep and base_model and effort in _KNOWN_EFFORT_LEVELS.union(efforts):
+            return (
+                (_MODEL_CONFIG_OPTION_ID, base_model),
+                (effort_config_id, effort),
+            )
     return ((_MODEL_CONFIG_OPTION_ID, model),)
 
 
@@ -611,25 +648,34 @@ async def _apply_acp_model(
     *,
     agent_name: str | None = None,
     via_config_option: bool,
+    effort_config_id: str | None = None,
+    efforts: Iterable[str] = (),
+    on_config_options: Callable[[Any], None] | None = None,
 ) -> None:
     """Apply ``model`` to a live ACP session via the mechanism the session
     advertised: ``set_config_option(configId="model")`` for configOptions-based
     servers (codex-acp, claude-agent-acp 0.44+), else ``set_session_model``.
 
-    The model id is normally the bare preset id listed by the server. For
-    Codex, callers may still pass a combined Canvas id such as ``gpt-5.5/high``;
-    codex-acp exposes reasoning effort as a separate config option, so split it
-    only on the config-options mechanism.
+    The model id is normally the bare preset id listed by the server. Callers
+    may pass a combined ``<model>/<effort>`` id; ACP servers expose reasoning
+    effort as a separate config option, so it is split only on the
+    config-options mechanism (see :func:`_model_config_options`).
+    ``on_config_options`` receives each ``set_config_option`` response, which
+    carries the session's refreshed options (effort levels depend on the model).
 
     agent-client-protocol 0.12.1 removed ``ClientSideConnection.set_session_model``;
     :class:`_ACPClientConnection` restores it, and a connection without it
     no-ops rather than raising ``AttributeError``.
     """
     if via_config_option:
-        for config_id, value in _model_config_options(agent_name, model):
-            await conn.set_config_option(
+        for config_id, value in _model_config_options(
+            agent_name, model, effort_config_id=effort_config_id, efforts=efforts
+        ):
+            response = await conn.set_config_option(
                 config_id=config_id, value=value, session_id=session_id
             )
+            if on_config_options is not None:
+                on_config_options(response)
     elif supports_legacy_model_switch(conn):
         await conn.set_session_model(model_id=model, session_id=session_id)  # type: ignore[attr-defined]
 
@@ -786,6 +832,9 @@ async def _maybe_set_session_model(
     acp_model: str | None,
     *,
     via_config_option: bool,
+    effort_config_id: str | None = None,
+    efforts: Iterable[str] = (),
+    on_config_options: Callable[[Any], None] | None = None,
 ) -> bool:
     """Apply the *initial* session model right after session creation.
 
@@ -824,6 +873,9 @@ async def _maybe_set_session_model(
             acp_model,
             agent_name=agent_name,
             via_config_option=via_config_option,
+            effort_config_id=effort_config_id,
+            efforts=efforts,
+            on_config_options=on_config_options,
         )
         return True
     except ACPRequestError as e:
@@ -844,6 +896,9 @@ async def _reapply_session_model_on_resume(
     acp_model: str | None,
     *,
     via_config_option: bool,
+    effort_config_id: str | None = None,
+    efforts: Iterable[str] = (),
+    on_config_options: Callable[[Any], None] | None = None,
 ) -> bool:
     """Reapply the persisted model to a *resumed* session.
 
@@ -878,6 +933,9 @@ async def _reapply_session_model_on_resume(
             acp_model,
             agent_name=agent_name,
             via_config_option=via_config_option,
+            effort_config_id=effort_config_id,
+            efforts=efforts,
+            on_config_options=on_config_options,
         )
         return True
     except ACPRequestError as e:
@@ -1922,6 +1980,11 @@ class ACPAgent(AgentBase):
     _stderr_log_task: Any = PrivateAttr(default=None)  # asyncio.Task
     _closed: bool = PrivateAttr(default=False)
     _working_dir: str = PrivateAttr(default="")
+    # The MCP servers the session was created with, and whether the server
+    # advertised ``session/resume``: rebuilding the live session on a model
+    # outside its own list resends both (see ``set_acp_model``).
+    _acp_mcp_servers: list[Any] = PrivateAttr(default_factory=list)
+    _supports_session_resume: bool = PrivateAttr(default=False)
     _agent_name: str = PrivateAttr(
         default=""
     )  # ACP server name from InitializeResponse
@@ -1965,6 +2028,17 @@ class ACPAgent(AgentBase):
     # ``acp_model`` as the active model. Read by ``init_state`` to decide whether
     # a stale persisted ``acp_current_model_id`` must be cleared.
     _model_override_applied: bool = PrivateAttr(default=False)
+    # Reasoning-effort select the session advertises as a config option
+    # (claude-agent-acp ``effort``, codex-acp ``reasoning_effort``; ACP category
+    # ``thought_level``). Refreshed from every config-options response because
+    # the levels depend on the selected model (claude drops ``effort`` for
+    # Haiku). ``_available_efforts`` is ``None`` until a response reports config
+    # options and ``[]`` when the current model has no effort levels. Lifted
+    # onto ``ConversationInfo.current_effort`` / ``available_efforts``; selected
+    # through a combined ``<model>/<effort>`` ``acp_model`` id.
+    _effort_config_id: str | None = PrivateAttr(default=None)
+    _current_effort: str | None = PrivateAttr(default=None)
+    _available_efforts: list[str] | None = PrivateAttr(default=None)
     # Callback to signal that the ACP subprocess is actively working.
     # Injected by the agent-server to call update_last_execution_time().
     _on_activity: Any = PrivateAttr(default=None)  # Callable[[], None] | None
@@ -2206,6 +2280,90 @@ class ACPAgent(AgentBase):
         return list(self._available_models or [])
 
     @property
+    def current_effort(self) -> str | None:
+        """Reasoning-effort level the live session reports for its model.
+
+        Read from the session's ``thought_level`` config option; ``None`` when
+        the server reports no effort option for the current model.
+        """
+        return self._current_effort
+
+    @property
+    def available_efforts(self) -> list[str]:
+        """Effort levels the server offers for the current model.
+
+        Empty when the server reports no effort option. Select one by passing
+        ``<model>/<effort>`` as the model id (``acp_model`` or a runtime switch).
+        """
+        return list(self._available_efforts or [])
+
+    def effort_agent_state(self) -> dict[str, Any] | None:
+        """``agent_state`` entries describing the session's effort state.
+
+        ``None`` while no response has reported config options, so callers
+        keep whatever was persisted before.
+        """
+        if self._available_efforts is None:
+            return None
+        return {
+            "acp_available_efforts": list(self._available_efforts),
+            "acp_current_effort": self._current_effort,
+            "acp_effort_config_id": self._effort_config_id,
+        }
+
+    def _absorb_effort_state(self, response: Any) -> None:
+        """Refresh effort state from a response that carries config options.
+
+        Responses without config options leave the state untouched; a response
+        whose options have no effort select clears the current level but keeps
+        the last known option id, which a later combined id still needs.
+        """
+        effort = extract_session_efforts(response)
+        if effort.available_efforts is None:
+            return
+        if effort.config_id is not None:
+            self._effort_config_id = effort.config_id
+        self._current_effort = effort.current_effort
+        self._available_efforts = effort.available_efforts
+
+    def _switch_needs_session_rebuild(self, model: str) -> bool:
+        """Whether ``model`` can reach the live session only by rebuilding it.
+
+        claude-agent-acp switches a live session only to the models in its own
+        picker, but takes any model the account can use in the session
+        ``_meta`` -- the one model-selection path that works for an account
+        catalogue model such as ``claude-mythos-5-1``. A model the session
+        does not list is therefore applied by resuming the same session with a
+        new ``_meta`` model, which rebuilds it on that model with its history.
+        """
+        provider = detect_acp_provider_by_agent_name(self._agent_name)
+        if (
+            provider is None
+            or provider.session_meta_key is None
+            or not self._supports_session_resume
+            or not self._model_via_config_option
+        ):
+            return False
+        listed = {info.model_id for info in self._available_models or []}
+        return bool(listed) and model not in listed
+
+    async def _rebuild_session_on_model(
+        self, conn: ClientSideConnection, session_id: str, model: str
+    ) -> None:
+        response = await conn.resume_session(
+            session_id=session_id,
+            cwd=self._working_dir,
+            mcp_servers=self._acp_mcp_servers,
+            **build_session_model_meta(self._agent_name, model),
+        )
+        _, available_models, _ = _extract_session_models(
+            response, default_via_config_option=True
+        )
+        if available_models is not None:
+            self._available_models = available_models
+        self._absorb_effort_state(response)
+
+    @property
     def supports_runtime_model_switch(self) -> bool:
         """Whether a live, mid-conversation model switch will be attempted.
 
@@ -2417,6 +2575,14 @@ class ACPAgent(AgentBase):
             ]
         elif not truly_resumed:
             new_agent_state.pop("acp_available_models", None)
+        # Effort state, persisted for the same cold reads; a resume whose
+        # responses reported no config options keeps the stored values.
+        effort_state = self.effort_agent_state()
+        if effort_state is not None:
+            merge_agent_state(new_agent_state, effort_state)
+        elif not truly_resumed:
+            for key in _EFFORT_AGENT_STATE_KEYS:
+                new_agent_state.pop(key, None)
         state.agent_state = new_agent_state
 
         if self._installed_suffix:
@@ -3044,6 +3210,11 @@ class ACPAgent(AgentBase):
         async def _init() -> tuple[
             str, str, str, str | None, list[ACPModelInfo] | None, bool
         ]:
+            # Effort state is per launch; a restart must not report the
+            # previous session's levels.
+            self._effort_config_id = None
+            self._current_effort = None
+            self._available_efforts = None
             # Spawn the subprocess directly so we can install a
             # filtering reader that skips non-JSON-RPC lines some
             # ACP servers (e.g. claude-code-acp v0.1.x) write to
@@ -3116,6 +3287,15 @@ class ACPAgent(AgentBase):
                 else None
             )
             acp_mcp_servers = _mcp_config_to_acp_servers(self.mcp_config, mcp_caps)
+            self._acp_mcp_servers = list(acp_mcp_servers)
+            session_caps = (
+                init_response.agent_capabilities.session_capabilities
+                if init_response.agent_capabilities is not None
+                else None
+            )
+            self._supports_session_resume = (
+                session_caps is not None and session_caps.resume is not None
+            )
             if acp_mcp_servers:
                 logger.info(
                     "Forwarding %d MCP server(s) to ACP session: %s",
@@ -3229,6 +3409,13 @@ class ACPAgent(AgentBase):
                         load_response,
                         default_via_config_option=persisted_via_config_option,
                     )
+                    self._absorb_effort_state(load_response)
+                    if self._effort_config_id is None:
+                        persisted_effort_id = state.agent_state.get(
+                            "acp_effort_config_id"
+                        )
+                        if isinstance(persisted_effort_id, str):
+                            self._effort_config_id = persisted_effort_id
                     logger.info(
                         "Resumed ACP session %s (cwd=%s)",
                         _fingerprint_session_id(session_id),
@@ -3252,7 +3439,15 @@ class ACPAgent(AgentBase):
                 # model selection). Extra kwargs to new_session() become the
                 # _meta dict in the JSON-RPC request — do NOT wrap in _meta=
                 # (that double-nests).
-                session_meta = build_session_model_meta(agent_name, self.acp_model)
+                # Only the model goes in _meta: a combined ``<model>/<effort>``
+                # id there makes claude-agent-acp list it as a custom model.
+                # The effort is applied by the protocol call below.
+                meta_model = (
+                    _model_config_options(agent_name, self.acp_model)[0][1]
+                    if self.acp_model
+                    else None
+                )
+                session_meta = build_session_model_meta(agent_name, meta_model)
                 response = await conn.new_session(
                     cwd=working_dir,
                     mcp_servers=acp_mcp_servers,
@@ -3267,6 +3462,7 @@ class ACPAgent(AgentBase):
                     available_models,
                     self._model_via_config_option,
                 ) = _extract_session_models(response)
+                self._absorb_effort_state(response)
                 # Initial-model protocol call for every built-in provider
                 # (codex, gemini, claude-code). The pinned claude/codex CLIs
                 # ignore the _meta above, so this protocol call is what actually
@@ -3279,6 +3475,9 @@ class ACPAgent(AgentBase):
                     session_id,
                     self.acp_model,
                     via_config_option=self._model_via_config_option,
+                    effort_config_id=self._effort_config_id,
+                    efforts=self._available_efforts or (),
+                    on_config_options=self._absorb_effort_state,
                 )
                 # set_session_model is the authoritative signal that acp_model
                 # reached the server. _meta is a no-op on the pinned claude CLI,
@@ -3299,6 +3498,9 @@ class ACPAgent(AgentBase):
                     session_id,
                     self.acp_model,
                     via_config_option=self._model_via_config_option,
+                    effort_config_id=self._effort_config_id,
+                    efforts=self._available_efforts or (),
+                    on_config_options=self._absorb_effort_state,
                 )
 
             # Resolve the model the agent will actually use.
@@ -4488,22 +4690,50 @@ class ACPAgent(AgentBase):
         assert self._session_id is not None
         conn = self._conn
         session_id = self._session_id
+        base_model = _model_config_options(
+            self._agent_name,
+            model,
+            effort_config_id=self._effort_config_id,
+            efforts=self._available_efforts or (),
+        )[0][1]
+        rebuild = self._switch_needs_session_rebuild(base_model)
+
+        async def _switch() -> None:
+            if not rebuild:
+                await _apply_acp_model(
+                    conn,
+                    session_id,
+                    model,
+                    agent_name=self._agent_name,
+                    via_config_option=self._model_via_config_option,
+                    effort_config_id=self._effort_config_id,
+                    efforts=self._available_efforts or (),
+                    on_config_options=self._absorb_effort_state,
+                )
+                return
+            await self._rebuild_session_on_model(conn, session_id, base_model)
+            # The rebuilt session already runs the model, and selecting it
+            # again by id can fail (claude-agent-acp may still name the
+            # transcript's earlier model as current). Only an effort remains,
+            # checked against the levels the rebuilt session reported.
+            for config_id, value in _model_config_options(
+                self._agent_name,
+                model,
+                effort_config_id=self._effort_config_id,
+                efforts=self._available_efforts or (),
+            )[1:]:
+                response = await conn.set_config_option(
+                    config_id=config_id, value=value, session_id=session_id
+                )
+                self._absorb_effort_state(response)
+
         # Bounded round-trip: this runs while LocalConversation.switch_acp_model
         # holds the state lock, so a server that accepts the call but never
         # answers must not wedge the lock indefinitely. On timeout / protocol
         # error we propagate *before* mutating any local state, so the sentinel
         # LLM is only updated once the live session has actually switched.
         try:
-            self._executor.run_async(
-                _apply_acp_model(
-                    conn,
-                    session_id,
-                    model,
-                    agent_name=self._agent_name,
-                    via_config_option=self._model_via_config_option,
-                ),
-                timeout=self.acp_prompt_timeout,
-            )
+            self._executor.run_async(_switch(), timeout=self.acp_prompt_timeout)
         except ACPRequestError as e:
             # Server-internal failures (JSON-RPC -32603) are not the caller's
             # fault, and the prompt path already treats them as retriable. Let
@@ -4517,11 +4747,12 @@ class ACPAgent(AgentBase):
             # 400-class client error rather than an opaque 500. The mechanism is
             # the one the session advertised (``_model_via_config_option``), so
             # the message names the call that actually failed.
-            method = (
-                "set_config_option(model)"
-                if self._model_via_config_option
-                else "set_session_model"
-            )
+            if rebuild:
+                method = "session/resume"
+            elif self._model_via_config_option:
+                method = "set_config_option(model)"
+            else:
+                method = "set_session_model"
             raise ValueError(
                 f"ACP server rejected {method}(model={model!r}): {e}"
             ) from e
@@ -4547,6 +4778,49 @@ class ACPAgent(AgentBase):
             provider.key if provider else "unknown",
             _fingerprint_session_id(self._session_id),
         )
+
+    def probe_model_efforts(self, max_models: int = 32) -> dict[str, list[str]]:
+        """Report the effort levels the live session offers for each model.
+
+        Effort levels depend on the model, so this selects each available model
+        in turn and reads the refreshed config options, then restores the
+        session's original model. Used by model discovery on a throwaway
+        session; best-effort, returning what it learned before any failure.
+        Empty for servers that select models without config options.
+        """
+        if not self._model_via_config_option or not self.has_live_acp_session:
+            return {}
+        assert self._conn is not None
+        assert self._session_id is not None
+        conn = self._conn
+        session_id = self._session_id
+        models = [m.model_id for m in (self._available_models or [])][:max_models]
+        original = self._current_model_id
+        found: dict[str, list[str]] = {}
+
+        async def _probe() -> None:
+            for model_id in models:
+                response = await conn.set_config_option(
+                    config_id=_MODEL_CONFIG_OPTION_ID,
+                    value=model_id,
+                    session_id=session_id,
+                )
+                levels = extract_session_efforts(response).available_efforts
+                if levels is not None:
+                    found[model_id] = levels
+            if original and original in models:
+                response = await conn.set_config_option(
+                    config_id=_MODEL_CONFIG_OPTION_ID,
+                    value=original,
+                    session_id=session_id,
+                )
+                self._absorb_effort_state(response)
+
+        try:
+            self._executor.run_async(_probe, timeout=self.acp_startup_timeout)
+        except Exception as e:
+            logger.warning("Could not probe ACP effort levels per model (%s)", e)
+        return found
 
     def close(self) -> None:
         """Terminate the ACP subprocess and clean up resources."""

@@ -32,7 +32,6 @@ from openhands.sdk.agent.acp_agent import (
     _auth_selection_failure_reason,
     _classify_acp_init_error,
     _classify_acp_turn_error,
-    _codex_model_config_options,
     _estimate_cost_from_tokens,
     _extract_session_models,
     _extract_token_usage,
@@ -42,6 +41,7 @@ from openhands.sdk.agent.acp_agent import (
     _mask_json_value,
     _maybe_set_session_model,
     _mcp_config_to_acp_servers,
+    _model_config_options,
     _NewSessionResponse,
     _npx_packages,
     _OpenHandsACPBridge,
@@ -84,6 +84,7 @@ from openhands.sdk.llm import ImageContent, Message, TextContent
 from openhands.sdk.mcp.config import coerce_mcp_config
 from openhands.sdk.secret import SecretSource
 from openhands.sdk.settings.acp_install_catalog import (
+    CODEX_ACP_VERSION,
     ACPInstallSpec,
     ACPPackagePin,
 )
@@ -177,11 +178,11 @@ def _make_state(tmp_path) -> ConversationState:
 
 def test_logs_matching_acp_provider_version(caplog):
     with caplog.at_level("INFO"):
-        _log_acp_provider_version("codex-acp", "1.10.0")
+        _log_acp_provider_version("codex-acp", CODEX_ACP_VERSION)
 
     assert "provider=codex" in caplog.text
-    assert "pinned_version='1.10.0'" in caplog.text
-    assert "reported_version='1.10.0'" in caplog.text
+    assert f"pinned_version='{CODEX_ACP_VERSION}'" in caplog.text
+    assert f"reported_version='{CODEX_ACP_VERSION}'" in caplog.text
     assert "mismatch" not in caplog.text
 
 
@@ -5386,17 +5387,44 @@ class TestWithCodexBaseUrl:
         assert _with_codex_base_url("codex-acp", [], env) == env
 
 
-class TestCodexModelConfigOptions:
-    def test_splits_combined_model_and_reasoning_effort(self):
-        assert _codex_model_config_options("gpt-5.5/high") == (
-            ("model", "gpt-5.5"),
-            ("reasoning_effort", "high"),
-        )
+class TestModelConfigOptions:
+    @pytest.mark.parametrize(
+        ("agent_name", "model", "expected"),
+        [
+            (
+                "codex-acp",
+                "gpt-5.5/high",
+                (("model", "gpt-5.5"), ("reasoning_effort", "high")),
+            ),
+            # codex-acp 2.x offers levels above xhigh.
+            (
+                "codex-acp",
+                "gpt-6-astra/ultra",
+                (("model", "gpt-6-astra"), ("reasoning_effort", "ultra")),
+            ),
+            (
+                "@agentclientprotocol/claude-agent-acp",
+                "opus/max",
+                (("model", "opus"), ("effort", "max")),
+            ),
+        ],
+    )
+    def test_splits_combined_model_and_effort(self, agent_name, model, expected):
+        assert _model_config_options(agent_name, model) == expected
+
+    def test_session_reported_effort_option_and_levels_win(self):
+        assert _model_config_options(
+            "my-custom-acp", "m/turbo", effort_config_id="thinking", efforts=["turbo"]
+        ) == (("model", "m"), ("thinking", "turbo"))
 
     def test_leaves_base_or_custom_model_id_unchanged(self):
-        assert _codex_model_config_options("gpt-5.5") == (("model", "gpt-5.5"),)
-        assert _codex_model_config_options("custom/provider/model") == (
+        assert _model_config_options("codex-acp", "gpt-5.5") == (("model", "gpt-5.5"),)
+        assert _model_config_options("codex-acp", "custom/provider/model") == (
             ("model", "custom/provider/model"),
+        )
+        # An unknown server that reported no effort option has nothing to split to.
+        assert _model_config_options("my-custom-acp", "m/high") == (
+            ("model", "m/high"),
         )
 
 

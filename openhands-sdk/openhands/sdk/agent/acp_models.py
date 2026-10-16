@@ -164,6 +164,27 @@ class ACPModelDiscovery(BaseModel):
         default=False,
         description="Whether a conversation can switch among these models live.",
     )
+    current_effort: str | None = Field(
+        default=None,
+        description=(
+            "Reasoning-effort level the server picks for ``current_model_id``, "
+            "from its ``thought_level`` config option. ``None`` when the model "
+            "has no effort option."
+        ),
+    )
+    available_efforts: list[str] = Field(
+        default_factory=list,
+        description="Effort levels the server offers for ``current_model_id``.",
+    )
+    efforts_by_model: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Effort levels per ``available_models`` id; a model with no effort "
+            "option maps to an empty list. Select a level with a combined "
+            "``<model>/<effort>`` model id. Empty when the server does not "
+            "select models through config options."
+        ),
+    )
     error: ACPModelDiscoveryError | None = Field(
         default=None,
         description="Set when the server could not start a session.",

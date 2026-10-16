@@ -3,7 +3,15 @@
 ``FAKE_ACP_MODELS`` picks how models are reported: ``config`` (a ``model``
 configOptions select) or ``legacy`` (the UNSTABLE ``models`` block). A
 ``FAKE_ACP_KEY`` in the environment unlocks a ``premium`` model; with
-``FAKE_ACP_REQUIRE_KEY`` set, ``session/new`` fails without it.
+``FAKE_ACP_REQUIRE_KEY`` set, ``session/new`` fails without it. With
+``FAKE_ACP_EFFORT`` set, an ``effort`` select (category ``thought_level``)
+follows the model: its levels depend on the model and it disappears for a model
+without any, like claude-agent-acp's ``effort`` for Haiku. ``FAKE_ACP_AGENT_NAME``
+overrides the reported agent name; like claude-agent-acp, a ``_meta`` model the
+server doesn't know is added to its model list as a custom model. With
+``FAKE_ACP_RESUME`` set the server advertises ``session/resume``, which, like
+claude-agent-acp's, rebuilds the session on the ``_meta`` model it carries;
+selecting such a model again by id then fails, as it can for claude-agent-acp.
 """
 
 import json
@@ -13,6 +21,9 @@ from typing import Any
 
 
 MODELS = ["m1", "m2"] + (["premium"] if os.environ.get("FAKE_ACP_KEY") else [])
+RESUMED_MODELS: set[str] = set()
+EFFORTS = {"m1": ["low", "high"], "m2": [], "premium": ["low", "high", "max"]}
+session = {"model": "m1", "effort": "low"}
 
 
 def respond(request_id, result=None, error=None):
@@ -35,7 +46,61 @@ def model_select(current: str) -> dict[str, Any]:
     }
 
 
-def new_session():
+def config_options() -> list[dict[str, Any]]:
+    options = [model_select(session["model"])]
+    levels = EFFORTS[session["model"]] if os.environ.get("FAKE_ACP_EFFORT") else []
+    if levels:
+        if session["effort"] not in levels:
+            session["effort"] = levels[0]
+        options.append(
+            {
+                "id": "effort",
+                "name": "Effort",
+                "category": "thought_level",
+                "type": "select",
+                "currentValue": session["effort"],
+                "options": [{"value": level, "name": level} for level in levels],
+            }
+        )
+    return options
+
+
+def set_config_option(config_id: Any, value: Any) -> tuple[Any, Any]:
+    if config_id == "effort":
+        if value not in EFFORTS.get(session["model"], []):
+            return None, {"code": -32602, "message": "Unknown effort"}
+        session["effort"] = value
+    elif value in RESUMED_MODELS:
+        return None, {"code": -32603, "message": "Internal error"}
+    elif value in MODELS:
+        session["model"] = value
+    else:
+        return None, {"code": -32602, "message": "Unknown model"}
+    return {"configOptions": config_options()}, None
+
+
+def meta_model_of(params: dict[str, Any]) -> Any:
+    return (
+        ((params.get("_meta") or {}).get("claudeCode") or {}).get("options") or {}
+    ).get("model")
+
+
+def resume_session(params: dict[str, Any]) -> dict[str, Any]:
+    meta_model = meta_model_of(params)
+    if meta_model:
+        if meta_model not in MODELS:
+            MODELS.append(meta_model)
+            EFFORTS[meta_model] = ["low", "high", "max"]
+            RESUMED_MODELS.add(meta_model)
+        session["model"] = meta_model
+    return {"configOptions": config_options()}
+
+
+def new_session(params: dict[str, Any]):
+    meta_model = meta_model_of(params)
+    if meta_model and meta_model not in MODELS:
+        MODELS.append(meta_model)
+        EFFORTS[meta_model] = []
     if os.environ.get("FAKE_ACP_REQUIRE_KEY") and not os.environ.get("FAKE_ACP_KEY"):
         return None, {"code": -32000, "message": "Authentication required"}
     result: dict[str, Any] = {"sessionId": "fake-session"}
@@ -48,7 +113,7 @@ def new_session():
             ],
         }
     else:
-        result["configOptions"] = [model_select("m1")]
+        result["configOptions"] = config_options()
     return result, None
 
 
@@ -61,24 +126,33 @@ def main():
         method = message["method"]
         params = message.get("params") or {}
         if method == "initialize":
-            respond(
-                request_id,
-                {
-                    "protocolVersion": 1,
-                    "agentInfo": {"name": "fake-acp", "version": "1.2.3"},
+            result = {
+                "protocolVersion": 1,
+                "agentInfo": {
+                    "name": os.environ.get("FAKE_ACP_AGENT_NAME", "fake-acp"),
+                    "version": "1.2.3",
                 },
-            )
+            }
+            if os.environ.get("FAKE_ACP_RESUME"):
+                result["agentCapabilities"] = {"sessionCapabilities": {"resume": {}}}
+            respond(request_id, result)
         elif method == "session/new":
-            result, error = new_session()
+            result, error = new_session(params)
             respond(request_id, result, error)
-        elif method in ("session/set_model", "session/set_config_option"):
-            model = params.get("modelId") or params.get("value")
-            if model not in MODELS:
+        elif method == "session/resume" and os.environ.get("FAKE_ACP_RESUME"):
+            respond(request_id, resume_session(params))
+        elif method == "session/set_mode":
+            respond(request_id)
+        elif method == "session/set_model":
+            if params.get("modelId") not in MODELS:
                 respond(request_id, error={"code": -32602, "message": "Unknown model"})
-            elif method == "session/set_model":
-                respond(request_id)
             else:
-                respond(request_id, {"configOptions": [model_select(model)]})
+                respond(request_id)
+        elif method == "session/set_config_option":
+            result, error = set_config_option(
+                params.get("configId"), params.get("value")
+            )
+            respond(request_id, result, error)
         else:
             respond(request_id, error={"code": -32601, "message": "Method not found"})
 

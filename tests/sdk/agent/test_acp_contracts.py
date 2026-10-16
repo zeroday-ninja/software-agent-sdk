@@ -12,6 +12,7 @@ from openhands.sdk.agent.acp_contracts import (
     ACPMcpCapabilities,
     ACPRevisionedCredentialBinding,
     extract_model_config_option,
+    extract_session_efforts,
     extract_session_models,
     is_model_dumpable,
     normalize_acp_error,
@@ -170,6 +171,61 @@ class TestSessionModelContracts:
         state = extract_session_models(response)
         assert state.current_model_id == "modern"
         assert state.via_config_option is True
+
+
+def _select(option_id: str, values: list[str], **extra) -> dict:
+    return {
+        "id": option_id,
+        "type": "select",
+        "current_value": values[0] if values else None,
+        "options": [{"value": v} for v in values],
+        **extra,
+    }
+
+
+class TestSessionEffortContracts:
+    def test_reads_the_thought_level_select(self):
+        response = {
+            "config_options": [
+                _select("model", ["sonnet"]),
+                _select("depth", ["low", "max"], category="thought_level"),
+            ]
+        }
+
+        effort = extract_session_efforts(response)
+
+        assert (effort.config_id, effort.current_effort) == ("depth", "low")
+        assert effort.available_efforts == ["low", "max"]
+
+    def test_recognizes_known_effort_ids_without_a_category(self):
+        response = {"config_options": [_select("reasoning_effort", ["medium"])]}
+
+        assert extract_session_efforts(response).config_id == "reasoning_effort"
+
+    def test_distinguishes_unreported_from_a_model_without_effort(self):
+        assert extract_session_efforts({}).available_efforts is None
+        no_effort = {"config_options": [_select("model", ["haiku"])]}
+        assert extract_session_efforts(no_effort).available_efforts == []
+
+    def test_flattens_grouped_select_options(self):
+        response = {
+            "config_options": [
+                {
+                    "id": "model",
+                    "type": "select",
+                    "current_value": "a",
+                    "options": [
+                        {"value": "a"},
+                        {"group": "more", "name": "More", "options": [{"value": "b"}]},
+                    ],
+                }
+            ]
+        }
+
+        option = extract_model_config_option(response)
+
+        assert option is not None
+        assert [o["value"] for o in option.options] == ["a", "b"]
 
 
 class TestMcpCapabilitiesContracts:

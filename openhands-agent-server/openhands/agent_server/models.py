@@ -318,6 +318,22 @@ class _ConversationInfoBase(BaseModel):
             '``"Opus 4.7 with 1M context · ..."``).'
         ),
     )
+    current_effort: str | None = Field(
+        default=None,
+        description=(
+            "Reasoning-effort level the ACP agent's live session reports for its "
+            "current model (the server's ``thought_level`` config option, e.g. "
+            "claude-agent-acp ``effort`` or codex-acp ``reasoning_effort``). "
+            "``None`` for non-ACP agents and models without effort levels."
+        ),
+    )
+    available_efforts: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Effort levels the ACP agent offers for its current model. Select "
+            "one by switching to a combined ``<model>/<effort>`` model id."
+        ),
+    )
     supports_runtime_model_switch: bool = Field(
         default=False,
         description=(

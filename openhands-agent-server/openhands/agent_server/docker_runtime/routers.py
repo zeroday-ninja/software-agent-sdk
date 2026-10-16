@@ -14,6 +14,9 @@ from fastapi import APIRouter, HTTPException, Query, Request, WebSocket
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from openhands.agent_server.dependencies import get_conversation_service
+from openhands.agent_server.docker_runtime.codex_login import (
+    adopt_refreshed_codex_login,
+)
 from openhands.agent_server.docker_runtime.mediation import materialize_secrets
 from openhands.agent_server.docker_runtime.proxy import (
     bridge_websocket,
@@ -38,7 +41,11 @@ from openhands.agent_server.models import (
     StartConversationRequest,
     UpdateSecretsRequest,
 )
-from openhands.agent_server.persistence import PersistedSettings, get_settings_store
+from openhands.agent_server.persistence import (
+    PersistedSettings,
+    get_secrets_store,
+    get_settings_store,
+)
 from openhands.agent_server.utils import safe_rmtree
 from openhands.sdk.launch import AgentLaunchError, LaunchStoreError, ResolvedLaunch
 from openhands.sdk.logger import get_logger
@@ -206,6 +213,13 @@ async def _prepare_forward(
     its container returns the conversation as it is.
     """
     config = registry.config
+    # Before the request's secret references resolve against the store: a
+    # sandbox may have refreshed (and so rotated) the stored Codex login.
+    await asyncio.to_thread(
+        adopt_refreshed_codex_login,
+        config.conversations_path,
+        get_secrets_store(config),
+    )
     start = StartConversationRequest.model_validate(
         body,
         context={"cipher": config.cipher} if body.get("secrets_encrypted") else None,
@@ -305,6 +319,12 @@ async def delete_conversation(conversation_id: UUID, request: Request) -> Respon
     # partially deleted state.
     try:
         await registry.stop(conversation_id)
+        # The sandbox may hold the only copy of a refreshed Codex login.
+        await asyncio.to_thread(
+            adopt_refreshed_codex_login,
+            registry.config.conversations_path,
+            get_secrets_store(registry.config),
+        )
         registry.provisioning.manifest_path(conversation_id).unlink(missing_ok=True)
         registry.archived_marker(conversation_id).unlink(missing_ok=True)
         await asyncio.to_thread(
