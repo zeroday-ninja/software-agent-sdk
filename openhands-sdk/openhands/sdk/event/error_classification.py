@@ -70,6 +70,10 @@ def classify_error(code: str, detail: str = "") -> ErrorClassification:
     # raise the configured limit rather than treating this as an SDK failure.
     if code in {"MaxBudgetReached"}:
         return _failure(FailureKind.QUOTA, user_action="settings")
+    # An ACP runtime's subscription usage window is exhausted (ACPAgent
+    # classifies the CLI's own notice); it clears with time or a fallback.
+    if code in {"ACPUsageLimit"}:
+        return _failure(FailureKind.QUOTA, user_action="settings")
     if code in {
         "LLMBadRequestError",
         "ACPInitError",

@@ -45,6 +45,8 @@ def build_seed_profile(
             acp_server=agent_settings.acp_server,
             acp_model=agent_settings.acp_model,
             acp_session_mode=agent_settings.acp_session_mode,
+            acp_fallback_server=agent_settings.acp_fallback_server,
+            acp_fallback_model=agent_settings.acp_fallback_model,
             acp_prompt_timeout=agent_settings.acp_prompt_timeout,
             acp_startup_timeout=agent_settings.acp_startup_timeout,
             # Settings store the command as a token list; the profile holds a

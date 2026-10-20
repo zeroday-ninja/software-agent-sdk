@@ -169,4 +169,6 @@ export const ACP_SETTINGS_KEYS: readonly string[] = [
   'acp_prompt_timeout',
   'acp_server',
   'acp_isolate_data_dir',
+  'acp_fallback_server',
+  'acp_fallback_model',
 ];

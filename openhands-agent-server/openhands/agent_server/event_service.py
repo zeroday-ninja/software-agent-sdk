@@ -2058,6 +2058,26 @@ class EventService:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._conversation.switch_acp_model, model)
 
+    async def switch_acp_server(
+        self,
+        acp_server: str,
+        model: str | None = None,
+        acp_command: list[str] | None = None,
+    ) -> None:
+        """Replace the ACP runtime of a live conversation (see
+        ``LocalConversation.switch_acp_server``). The subprocess start blocks,
+        so it runs in a worker thread.
+        """
+        if self._conversation is None:
+            raise ValueError("inactive_service")
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: self._conversation.switch_acp_server(  # type: ignore[union-attr]
+                acp_server, model, acp_command=acp_command
+            ),
+        )
+
     async def close(self):
         if self.bash_event_service is not None:
             await self.bash_event_service.close()

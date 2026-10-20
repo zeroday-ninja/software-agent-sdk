@@ -1414,6 +1414,52 @@ def test_switch_acp_model_success(
         client.app.dependency_overrides.clear()
 
 
+def test_switch_acp_server_success(
+    client, mock_conversation_service, mock_event_service, sample_conversation_id
+):
+    """switch_acp_server forwards the runtime, model, and command."""
+    mock_conversation_service.get_event_service.return_value = mock_event_service
+    mock_event_service.switch_acp_server.return_value = None
+
+    client.app.dependency_overrides[get_conversation_service] = lambda: (
+        mock_conversation_service
+    )
+    try:
+        response = client.post(
+            f"/api/conversations/{sample_conversation_id}/switch_acp_server",
+            json={"acp_server": "codex", "model": "gpt-5.5/high"},
+        )
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        mock_event_service.switch_acp_server.assert_awaited_once_with(
+            "codex", "gpt-5.5/high", None
+        )
+    finally:
+        client.app.dependency_overrides.clear()
+
+
+def test_switch_acp_server_unsupported_returns_400(
+    client, mock_conversation_service, mock_event_service, sample_conversation_id
+):
+    mock_conversation_service.get_event_service.return_value = mock_event_service
+    mock_event_service.switch_acp_server.side_effect = ValueError(
+        "Unsupported ACP server 'nope'"
+    )
+
+    client.app.dependency_overrides[get_conversation_service] = lambda: (
+        mock_conversation_service
+    )
+    try:
+        response = client.post(
+            f"/api/conversations/{sample_conversation_id}/switch_acp_server",
+            json={"acp_server": "nope"},
+        )
+        assert response.status_code == 400
+        assert "Unsupported ACP server" in response.json()["detail"]
+    finally:
+        client.app.dependency_overrides.clear()
+
+
 def test_switch_acp_model_not_found(
     client, mock_conversation_service, sample_conversation_id
 ):

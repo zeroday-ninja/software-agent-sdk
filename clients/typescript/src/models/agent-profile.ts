@@ -83,6 +83,13 @@ export interface ACPAgentProfile extends AgentProfileBase {
   acp_server: ACPServerKind;
   acp_model: string | null;
   acp_session_mode: string | null;
+  /**
+   * Runtime to fail over to when `acp_server` reports an exhausted usage
+   * limit; `null` disables failover. Absent on servers before 1.56.
+   */
+  acp_fallback_server?: ACPServerKind | null;
+  /** Model (optionally `<model>/<effort>`) for the fallback runtime. */
+  acp_fallback_model?: string | null;
   acp_prompt_timeout: number;
   acp_command: string | null;
   acp_args: string[] | null;

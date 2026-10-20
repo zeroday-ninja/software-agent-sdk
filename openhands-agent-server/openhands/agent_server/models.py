@@ -456,6 +456,28 @@ class ConfirmationResponseRequest(BaseModel):
     reason: str = "User rejected the action."
 
 
+class SwitchACPServerRequest(BaseModel):
+    """Body of ``POST /api/conversations/{id}/switch_acp_server``."""
+
+    acp_server: str = Field(
+        description=(
+            "Provider registry key of the ACP runtime to switch to "
+            "(``claude-code``, ``codex``, ...; ``custom`` needs ``acp_command``)."
+        )
+    )
+    model: str | None = Field(
+        default=None,
+        description=(
+            "Model for the new runtime, optionally ``<model>/<effort>``; None "
+            "lets it pick its default."
+        ),
+    )
+    acp_command: list[str] | None = Field(
+        default=None,
+        description="Launch command, required for ``acp_server='custom'``.",
+    )
+
+
 class Success(BaseModel):
     success: bool = True
 

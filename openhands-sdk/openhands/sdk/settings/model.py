@@ -1756,6 +1756,45 @@ class ACPAgentSettings(AgentSettingsBase):
             ).model_dump(),
         },
     )
+    acp_fallback_server: ACPServerKind | None = Field(
+        default=None,
+        description=(
+            "ACP runtime to fail over to when :attr:`acp_server` reports an "
+            "exhausted usage limit (for example ``codex`` for a ``claude-code`` "
+            "agent). The conversation switches runtime in place and replays "
+            "its history to the new one. Leave blank to disable. Credentials "
+            "for the fallback must also be available to the conversation."
+        ),
+        json_schema_extra={
+            SETTINGS_METADATA_KEY: SettingsFieldMetadata(
+                label="Fallback ACP server on usage limits",
+                prominence=SettingProminence.MINOR,
+            ).model_dump(),
+            SETTINGS_SECTION_METADATA_KEY: SettingsSectionMetadata(
+                key="acp",
+                label="ACP (Agent Client Protocol)",
+                variant="acp",
+            ).model_dump(),
+        },
+    )
+    acp_fallback_model: str | None = Field(
+        default=None,
+        description=(
+            "Model (optionally ``<model>/<effort>``) for the fallback runtime. "
+            "Leave blank to let that runtime pick its default."
+        ),
+        json_schema_extra={
+            SETTINGS_METADATA_KEY: SettingsFieldMetadata(
+                label="Fallback ACP model",
+                prominence=SettingProminence.MINOR,
+            ).model_dump(),
+            SETTINGS_SECTION_METADATA_KEY: SettingsSectionMetadata(
+                key="acp",
+                label="ACP (Agent Client Protocol)",
+                variant="acp",
+            ).model_dump(),
+        },
+    )
     acp_prompt_timeout: float = Field(
         default=1800.0,
         gt=0,
@@ -2034,6 +2073,8 @@ class ACPAgentSettings(AgentSettingsBase):
             acp_args=list(self.acp_args),
             acp_model=self.acp_model,
             acp_session_mode=self.acp_session_mode,
+            acp_fallback_server=self.acp_fallback_server,
+            acp_fallback_model=self.acp_fallback_model,
             acp_prompt_timeout=self.acp_prompt_timeout,
             acp_startup_timeout=self.acp_startup_timeout,
             acp_isolate_data_dir=self.acp_isolate_data_dir,

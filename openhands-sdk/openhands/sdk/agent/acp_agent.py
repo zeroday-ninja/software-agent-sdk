@@ -110,6 +110,11 @@ from openhands.sdk.agent.acp_file_credentials import (
 )
 from openhands.sdk.agent.acp_models import ACPModelInfo
 from openhands.sdk.agent.acp_tracing import ACPTurnTrace
+from openhands.sdk.agent.acp_usage_limit import (
+    ACPUsageLimitError,
+    response_indicates_usage_limit,
+    text_indicates_usage_limit,
+)
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.agent.stream_context import StreamContext
 from openhands.sdk.context import AgentContext
@@ -1297,9 +1302,24 @@ def _classify_acp_turn_error(exc: BaseException) -> str:
     text = _acp_error_text(exc)
     if "usage policy" in text or "content policy" in text:
         return "UsagePolicyRefusal"
+    if isinstance(exc, ACPUsageLimitError) or _acp_error_indicates_usage_limit(exc):
+        return "ACPUsageLimit"
     if _acp_error_indicates_auth(exc):
         return "ACPAuthRequired"
     return "ACPPromptError"
+
+
+def _acp_error_indicates_usage_limit(exc: BaseException) -> bool:
+    """True when the failure says the runtime's usage limit is exhausted.
+
+    Both claude-agent-acp and codex-acp report this as a ``-32603`` carrying
+    the CLI's own notice; see :mod:`openhands.sdk.agent.acp_usage_limit`.
+    """
+    if isinstance(exc, ACPUsageLimitError):
+        return True
+    if not isinstance(exc, ACPRequestError):
+        return False
+    return text_indicates_usage_limit(_acp_error_text(exc))
 
 
 class _OpenHandsACPBridge:
@@ -1817,6 +1837,23 @@ class ACPAgent(AgentBase):
             "(pi-acp) skips the call."
         ),
     )
+    acp_fallback_server: str | None = Field(
+        default=None,
+        description=(
+            "Provider registry key of the ACP runtime to fail over to when this "
+            "one reports an exhausted usage limit (e.g. 'codex' for a "
+            "'claude-code' agent). The conversation then replaces this agent "
+            "with one for that provider, in place, and replays the history to "
+            "it. None disables failover."
+        ),
+    )
+    acp_fallback_model: str | None = Field(
+        default=None,
+        description=(
+            "Model (optionally '<model>/<effort>') for the fallback runtime; "
+            "None lets that runtime pick its default."
+        ),
+    )
     acp_prompt_timeout: float = Field(
         default=1800.0,
         description=(
@@ -2049,6 +2086,10 @@ class ACPAgent(AgentBase):
     _suffix_install_state: str = PrivateAttr(default="unused")
     _installed_suffix: str | None = PrivateAttr(default=None)
     _restart_session_on_next_turn: bool = PrivateAttr(default=False)
+    # Prior-session transcript to prepend to the next prompt after the
+    # conversation swapped this agent in for another runtime (see
+    # LocalConversation.switch_acp_server); cleared once a turn succeeds.
+    _bootstrap_transcript: str | None = PrivateAttr(default=None)
     # Stream identity for the turn in flight; see stream_context.py. Held on
     # the agent rather than threaded through the finalizers because the ACP
     # turn already resolves through four of them.
@@ -3781,6 +3822,11 @@ class ACPAgent(AgentBase):
         """Build the ACP content blocks for one user turn."""
         message = event.to_llm_message()
         blocks: list[TextContentBlock | ImageContentBlock] = []
+        if self._bootstrap_transcript:
+            # A runtime switch starts a fresh session on a server that never
+            # saw this conversation; lead with the history so the new agent
+            # continues the task instead of starting over.
+            blocks.append(text_block(self._bootstrap_transcript))
         for content in message.content:
             if isinstance(content, TextContent) and content.text.strip():
                 blocks.append(text_block(content.text))
@@ -3969,6 +4015,14 @@ class ACPAgent(AgentBase):
         thought_text = mask("".join(self._client.accumulated_thoughts))
         if not response_text:
             response_text = "(No response from ACP server)"
+        if self.acp_fallback_server and response_indicates_usage_limit(response_text):
+            # The CLI forwarded its usage-limit notice as a normal answer; a
+            # fallback is configured, so hand it to the conversation as a
+            # failure rather than finishing the turn on the notice.
+            raise ACPUsageLimitError(
+                redact_text_secrets(response_text)[:500], acp_server=self.acp_server
+            )
+        self._bootstrap_transcript = None
 
         self._client.trace.finish_turn(
             response_text, thought_text, self._client.accumulated_tool_calls
@@ -4046,6 +4100,28 @@ class ACPAgent(AgentBase):
         self._cancel_inflight_tool_calls()
         on_event(MessageEvent(source="agent", llm_message=error_message))
         state.execution_status = ConversationExecutionStatus.ERROR
+
+    def _usage_limit_failover(
+        self, exc: BaseException, state: ConversationState
+    ) -> ACPUsageLimitError | None:
+        """The error to hand the conversation when ``exc`` should fail over.
+
+        Returns an :class:`ACPUsageLimitError` when ``exc`` reports an
+        exhausted usage limit *and* a fallback runtime is configured; the
+        conversation then swaps runtimes instead of this agent ending the turn
+        in error. In-flight tool cards are closed here since this agent is
+        about to be replaced. ``None`` means: handle ``exc`` as a normal error.
+        """
+        if not self.acp_fallback_server or self.acp_fallback_server == self.acp_server:
+            return None
+        if not _acp_error_indicates_usage_limit(exc):
+            return None
+        self._cancel_inflight_tool_calls()
+        if isinstance(exc, ACPUsageLimitError):
+            return exc
+        return ACPUsageLimitError(
+            _acp_error_detail(exc, state.secret_registry), acp_server=self.acp_server
+        )
 
     def _emit_turn_error(
         self,
@@ -4262,6 +4338,8 @@ class ACPAgent(AgentBase):
                     if (
                         e.code in _RETRIABLE_SERVER_ERROR_CODES
                         and attempt < max_retries
+                        # An exhausted usage window won't clear in seconds.
+                        and not _acp_error_indicates_usage_limit(e)
                     ):
                         delay = _ACP_PROMPT_RETRY_DELAYS[
                             min(attempt, len(_ACP_PROMPT_RETRY_DELAYS) - 1)
@@ -4295,6 +4373,11 @@ class ACPAgent(AgentBase):
             self._request_session_cancel()
             self._emit_turn_timeout(time.monotonic() - t0, state, on_event)
         except Exception as e:
+            failover = self._usage_limit_failover(e, state)
+            if failover is e:
+                raise
+            if failover is not None:
+                raise failover from e
             self._emit_turn_error(e, state, on_event)
             # Re-raise so LocalConversation.run()'s outer except handler
             # breaks the loop, emits ConversationErrorEvent, and raises
@@ -4445,6 +4528,8 @@ class ACPAgent(AgentBase):
                     if (
                         e.code in _RETRIABLE_SERVER_ERROR_CODES
                         and attempt < max_retries
+                        # An exhausted usage window won't clear in seconds.
+                        and not _acp_error_indicates_usage_limit(e)
                     ):
                         delay = _ACP_PROMPT_RETRY_DELAYS[
                             min(attempt, len(_ACP_PROMPT_RETRY_DELAYS) - 1)
@@ -4549,6 +4634,11 @@ class ACPAgent(AgentBase):
                     self._restart_session_on_next_turn = True
         except Exception as e:
             with state:
+                failover = self._usage_limit_failover(e, state)
+                if failover is e:
+                    raise
+                if failover is not None:
+                    raise failover from e
                 self._emit_turn_error(e, state, on_event)
             raise
         finally:

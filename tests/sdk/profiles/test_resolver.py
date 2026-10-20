@@ -714,6 +714,8 @@ def test_acp_resolves_to_settings_without_credentials(
         acp_server="codex",
         acp_model="gpt-5.5/medium",
         acp_session_mode="full-access",
+        acp_fallback_server="claude-code",
+        acp_fallback_model="opus/high",
         acp_command="codex-acp --foo",
         acp_args=["--flag"],
         mcp_server_refs=["fetch"],
@@ -729,6 +731,8 @@ def test_acp_resolves_to_settings_without_credentials(
     assert settings.acp_server == "codex"
     assert settings.acp_model == "gpt-5.5/medium"
     assert settings.acp_session_mode == "full-access"
+    assert settings.acp_fallback_server == "claude-code"
+    assert settings.acp_fallback_model == "opus/high"
     # str command is tokenized into the settings' list[str] field.
     assert settings.acp_command == ["codex-acp", "--foo"]
     assert settings.acp_args == ["--flag"]

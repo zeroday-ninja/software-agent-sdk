@@ -8,7 +8,10 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePath
 from typing import Any, Final, TypeGuard, cast
 
+from pydantic import ValidationError
+
 from openhands.sdk.agent.acp_agent import ACPAgent, merge_agent_state
+from openhands.sdk.agent.acp_usage_limit import ACPUsageLimitError
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.agent.stream_context import StreamProgressCallbackType
 from openhands.sdk.context.condenser import CondenserBase, LLMSummarizingCondenser
@@ -51,6 +54,7 @@ from openhands.sdk.event import (
 )
 from openhands.sdk.event.conversation_error import ConversationErrorEvent
 from openhands.sdk.event.error_classification import AGENT_OUTCOME
+from openhands.sdk.event.resume_transcript import render_resume_transcript
 from openhands.sdk.hooks import HookConfig, HookEventProcessor, create_hook_callback
 from openhands.sdk.io import FileStore, LocalFileStore
 from openhands.sdk.llm import LLM, Message, TextContent, content_to_str
@@ -92,6 +96,7 @@ from openhands.sdk.security.analyzer import SecurityAnalyzerBase
 from openhands.sdk.security.confirmation_policy import (
     ConfirmationPolicyBase,
 )
+from openhands.sdk.settings.acp_providers import get_acp_provider
 from openhands.sdk.skills import (
     Skill,
     load_available_skills,
@@ -124,6 +129,26 @@ ACP_SUPERSEDE_INFLIGHT_PROMPT = "acp_supersede_inflight_prompt"
 _RUNTIME_MCP_TIMEOUT_SECS = 30
 
 ACP_STOP_HOOK_FEEDBACK_PREFIX = "[Stop hook feedback]"
+# ``agent_state`` keys that describe one ACP runtime's live session. They are
+# dropped when the conversation switches runtime so the new agent starts a
+# session of its own instead of trying to load the old server's.
+ACP_RUNTIME_STATE_KEYS: tuple[str, ...] = (
+    "acp_agent_name",
+    "acp_agent_version",
+    "acp_session_id",
+    "acp_session_cwd",
+    "acp_supports_runtime_model_switch",
+    "acp_model_via_config_option",
+    "acp_suffix_installed",
+    "acp_current_model_id",
+    "acp_available_models",
+    "acp_available_efforts",
+    "acp_current_effort",
+    "acp_effort_config_id",
+)
+# Set by a usage-limit failover: the registry key of the runtime that was
+# replaced, for clients that want to show where the conversation came from.
+ACP_FAILOVER_FROM_KEY = "acp_failover_from"
 
 ASK_AGENT_LLM_USAGE_ID: Final[str] = "ask-agent-llm"
 
@@ -157,6 +182,12 @@ def _latest_conversation_error(
         if isinstance(event, ConversationErrorEvent):
             return event
     return None
+
+
+def _acp_runtime_label(acp_server: str | None) -> str:
+    """Display name for an ACP provider key, or the key itself."""
+    info = get_acp_provider(acp_server) if acp_server else None
+    return info.display_name if info is not None else (acp_server or "The ACP agent")
 
 
 def _is_acp_prompt_message(event: Event) -> TypeGuard[MessageEvent]:
@@ -1736,6 +1767,168 @@ class LocalConversation(BaseConversation):
             self.llm_registry.add(llm)
             return llm
 
+    def switch_acp_server(
+        self,
+        acp_server: str,
+        model: str | None = None,
+        *,
+        acp_command: Sequence[str] | None = None,
+    ) -> None:
+        """Replace the ACP runtime of this conversation in place.
+
+        Unlike :meth:`switch_acp_model`, which keeps the subprocess and only
+        changes its model, this closes the current ACP subprocess, starts one
+        for ``acp_server`` (a registry key such as ``codex``; ``custom`` needs
+        ``acp_command``) with ``model`` (optionally ``<model>/<effort>``), and
+        replays the conversation history to the new runtime as a bootstrap
+        prompt on its first turn. The workspace, events, and secrets stay as
+        they are; credentials for the new runtime must already be among them.
+
+        Raises:
+            ValueError: If the agent is not an :class:`ACPAgent`, or
+                ``acp_server`` is unknown or lacks a launch command.
+        """
+        if not isinstance(self.agent, ACPAgent):
+            raise ValueError(
+                "switch_acp_server is only supported for ACP conversations."
+            )
+        with self._state:
+            self._replace_acp_agent(
+                acp_server, model, acp_command=acp_command, failover_from=None
+            )
+
+    def _fail_over_acp(self, error: ACPUsageLimitError) -> bool:
+        """Switch to the agent's fallback runtime after a usage-limit failure.
+
+        Returns True once the fallback runtime is live and the loop may prompt
+        again. Returns False when no fallback applies, or starting it failed;
+        the start failure is already surfaced as a ``ConversationErrorEvent``
+        with the conversation in ``ERROR``, so the caller re-raises ``error``.
+        """
+        agent = self.agent
+        if (
+            not isinstance(agent, ACPAgent)
+            or not agent.acp_fallback_server
+            or agent.acp_fallback_server == agent.acp_server
+        ):
+            return False
+        target = agent.acp_fallback_server
+        model = agent.acp_fallback_model
+        with self._state:
+            notice = (
+                f"{_acp_runtime_label(agent.acp_server)} reached its usage limit: "
+                f"{error.detail}\n\n"
+                f"Switching to {_acp_runtime_label(target)}"
+                f"{f' ({model})' if model else ''} and continuing."
+            )
+            logger.warning(
+                "ACP usage limit on %s; failing over to %s", agent.acp_server, target
+            )
+            self._on_event(
+                MessageEvent(
+                    source="agent",
+                    llm_message=Message(
+                        role="assistant", content=[TextContent(text=notice)]
+                    ),
+                )
+            )
+            try:
+                self._replace_acp_agent(
+                    target,
+                    model,
+                    acp_command=None,
+                    failover_from=agent.acp_server or "custom",
+                )
+            except Exception as e:
+                logger.error("ACP failover to %s failed: %s", target, e)
+                if self._state.execution_status != ConversationExecutionStatus.ERROR:
+                    # ACPAgent.init_state surfaces its own start failures;
+                    # anything else (an unknown fallback key, say) is ours.
+                    self._state.execution_status = ConversationExecutionStatus.ERROR
+                    self._on_event(
+                        ConversationErrorEvent(
+                            source="environment",
+                            code="ACPFailoverFailed",
+                            detail=f"Could not switch to {target}: {e}"[:500],
+                        )
+                    )
+                return False
+        return True
+
+    def _replace_acp_agent(
+        self,
+        acp_server: str,
+        model: str | None,
+        *,
+        acp_command: Sequence[str] | None,
+        failover_from: str | None,
+    ) -> ACPAgent:
+        """Build, persist, and start a new ACP agent for ``acp_server``.
+
+        Must be called with the state lock held. The old agent's subprocess is
+        closed; its metrics LLM is kept (it is what the registry and the
+        conversation stats know) and relabelled. The old runtime's session keys
+        leave ``agent_state`` so the new agent cannot try to resume a session
+        the new server never had; the new agent's first prompt carries the
+        rendered history instead.
+        """
+        from openhands.sdk.settings.model import ACPAgentSettings
+
+        old_agent = self.agent
+        assert isinstance(old_agent, ACPAgent)
+        settings_kwargs: dict[str, Any] = {
+            "acp_server": acp_server,
+            "acp_model": model,
+            "acp_prompt_timeout": old_agent.acp_prompt_timeout,
+            "acp_startup_timeout": old_agent.acp_startup_timeout,
+            "acp_isolate_data_dir": old_agent.acp_isolate_data_dir,
+            "acp_file_secrets": list(old_agent.acp_file_secrets),
+            "agent_context": old_agent.agent_context,
+            "mcp_config": old_agent.mcp_config,
+        }
+        if acp_command:
+            settings_kwargs["acp_command"] = list(acp_command)
+        try:
+            settings = ACPAgentSettings(**settings_kwargs)
+        except ValidationError as e:
+            raise ValueError(f"Unsupported ACP server {acp_server!r}: {e}") from e
+        new_agent = settings.create_agent().model_copy(update={"llm": old_agent.llm})
+        label = model or "acp-managed"
+        new_agent.llm.model = label
+        new_agent.llm.metrics.model_name = label
+
+        try:
+            old_agent.close()
+        except Exception:
+            logger.warning(
+                "Could not cleanly close the %s ACP runtime while switching",
+                old_agent.acp_server,
+                exc_info=True,
+            )
+
+        agent_state = {
+            key: value
+            for key, value in self._state.agent_state.items()
+            if key not in ACP_RUNTIME_STATE_KEYS
+        }
+        if failover_from is not None:
+            agent_state[ACP_FAILOVER_FROM_KEY] = failover_from
+        else:
+            agent_state.pop(ACP_FAILOVER_FROM_KEY, None)
+        self._state.agent_state = agent_state
+        new_agent._bootstrap_transcript = render_resume_transcript(
+            list(self._state.active_branch())
+        )
+        self.agent = new_agent
+        self._state.agent = new_agent
+        try:
+            new_agent.init_state(self._state, on_event=self._on_event)
+        except Exception:
+            # Let the next run() retry the start once the cause is fixed.
+            self._agent_ready = False
+            raise
+        return new_agent
+
     def switch_acp_model(self, model: str) -> None:
         """Switch the model on an ACP conversation.
 
@@ -2017,6 +2210,13 @@ class LocalConversation(BaseConversation):
                         self.agent.step(
                             self, on_event=self._on_event, on_token=self._on_token
                         )
+                    except ACPUsageLimitError as e:
+                        # The runtime's usage window is exhausted and a
+                        # fallback is configured: swap runtimes and prompt
+                        # again on the next iteration (the cursor is unchanged).
+                        if not self._fail_over_acp(e):
+                            raise
+                        continue
                     finally:
                         self._step_holds_state_lock = False
                     iteration += 1
@@ -2443,12 +2643,24 @@ class LocalConversation(BaseConversation):
                             ),
                         }
 
-                await self.agent.astep(
-                    self,
-                    on_event=self._on_event_with_state_lock,
-                    on_token=self._on_token,
-                    prompt_message=acp_step_user_message,
-                )
+                try:
+                    await self.agent.astep(
+                        self,
+                        on_event=self._on_event_with_state_lock,
+                        on_token=self._on_token,
+                        prompt_message=acp_step_user_message,
+                    )
+                except ACPUsageLimitError as e:
+                    # The runtime's usage window is exhausted and a fallback is
+                    # configured: swap runtimes (a blocking subprocess start,
+                    # so off the event loop) and prompt the same message again.
+                    loop = asyncio.get_running_loop()
+                    failed_over = await loop.run_in_executor(
+                        None, self._fail_over_acp, e
+                    )
+                    if not failed_over:
+                        raise
+                    continue
                 with self._state:
                     iteration += 1
                     pause_requested_during_acp_step = any(
