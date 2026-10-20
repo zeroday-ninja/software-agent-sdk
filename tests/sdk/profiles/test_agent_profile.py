@@ -255,6 +255,7 @@ def test_openhands_rejects_acp_fields() -> None:
         ("acp_command", "codex-acp"),
         ("acp_args", ["--flag"]),
         ("acp_session_mode", "full-access"),
+        ("acp_fallback_server", "claude-code"),
         ("acp_prompt_timeout", 600.0),
     ):
         with pytest.raises(ValidationError):

@@ -46,6 +46,7 @@ from openhands.agent_server.models import (
     StartConversationRequest,
     StartGoalRequest,
     Success,
+    SwitchACPServerRequest,
     UpdateConversationRequest,
     UpdateSecretsRequest,
     trim_conversation_response_skills,
@@ -679,6 +680,40 @@ async def load_conversation_plugin(
         FileNotFoundError,
         ValueError,
     ) as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
+    return Success()
+
+
+@conversation_router.post(
+    "/{conversation_id}/switch_acp_server",
+    responses={
+        400: {"description": "Agent is not ACP, or the server is unsupported"},
+        404: {"description": "Conversation not found"},
+    },
+)
+async def switch_conversation_acp_server(
+    conversation_id: UUID,
+    request: SwitchACPServerRequest,
+    conversation_service: ConversationService = Depends(get_conversation_service),
+) -> Success:
+    """Replace the ACP runtime of a conversation in place.
+
+    Closes the current ACP subprocess, starts ``acp_server`` (optionally on
+    ``model``), and replays the conversation history to it on its first turn.
+    This is the manual form of the usage-limit failover an ACP profile's
+    ``acp_fallback_server`` performs automatically.
+    """
+    event_service = await conversation_service.get_event_service(conversation_id)
+    if event_service is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND)
+    try:
+        await event_service.switch_acp_server(
+            request.acp_server, request.model, request.acp_command
+        )
+    except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),

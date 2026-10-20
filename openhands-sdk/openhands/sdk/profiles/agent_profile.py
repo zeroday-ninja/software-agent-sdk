@@ -318,6 +318,21 @@ class ACPAgentProfile(AgentProfileBase):
             "auto-detect from the ACP server type."
         ),
     )
+    acp_fallback_server: ACPServerKind | None = Field(
+        default=None,
+        description=(
+            "ACP runtime to fail over to when ``acp_server`` reports an "
+            "exhausted usage limit (e.g. 'codex' for a 'claude-code' profile). "
+            "Leave blank to disable failover."
+        ),
+    )
+    acp_fallback_model: str | None = Field(
+        default=None,
+        description=(
+            "Model (optionally '<model>/<effort>') for the fallback runtime. "
+            "Leave blank to let it pick its default."
+        ),
+    )
     acp_prompt_timeout: float = Field(
         default=1800.0,
         gt=0,

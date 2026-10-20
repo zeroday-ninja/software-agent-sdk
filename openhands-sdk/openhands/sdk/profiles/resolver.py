@@ -380,6 +380,8 @@ def _build_acp_settings(
         "acp_server": profile.acp_server,
         "acp_model": profile.acp_model,
         "acp_session_mode": profile.acp_session_mode,
+        "acp_fallback_server": profile.acp_fallback_server,
+        "acp_fallback_model": profile.acp_fallback_model,
         "acp_prompt_timeout": profile.acp_prompt_timeout,
         "acp_startup_timeout": profile.acp_startup_timeout,
         "acp_command": command,

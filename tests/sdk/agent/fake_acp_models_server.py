@@ -12,6 +12,10 @@ server doesn't know is added to its model list as a custom model. With
 ``FAKE_ACP_RESUME`` set the server advertises ``session/resume``, which, like
 claude-agent-acp's, rebuilds the session on the ``_meta`` model it carries;
 selecting such a model again by id then fails, as it can for claude-agent-acp.
+``session/prompt`` answers with one ``agent_message_chunk`` saying whether the
+prompt carried a resume transcript (``resumed``/``fresh``) and ends the turn;
+with ``FAKE_ACP_PROMPT_ERROR`` set it instead fails the prompt with a ``-32603``
+carrying that text, the way claude-agent-acp reports an exhausted usage limit.
 """
 
 import json
@@ -34,6 +38,42 @@ def respond(request_id, result=None, error=None):
         message["error"] = error
     sys.stdout.write(json.dumps(message) + "\n")
     sys.stdout.flush()
+
+
+def notify(method: str, params: dict[str, Any]) -> None:
+    sys.stdout.write(
+        json.dumps({"jsonrpc": "2.0", "method": method, "params": params}) + "\n"
+    )
+    sys.stdout.flush()
+
+
+def prompt(request_id, params: dict[str, Any]) -> None:
+    error_text = os.environ.get("FAKE_ACP_PROMPT_ERROR")
+    if error_text:
+        respond(
+            request_id,
+            error={"code": -32603, "message": f"Internal error: {error_text}"},
+        )
+        return
+    texts = [
+        block.get("text", "")
+        for block in params.get("prompt", [])
+        if isinstance(block, dict) and block.get("type") == "text"
+    ]
+    resumed = any("<<RESUMED CONVERSATION>>" in text for text in texts)
+    label = os.environ.get("FAKE_ACP_REPLY", "ok")
+    reply = f"{label} ({'resumed' if resumed else 'fresh'})"
+    notify(
+        "session/update",
+        {
+            "sessionId": params.get("sessionId"),
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": reply},
+            },
+        },
+    )
+    respond(request_id, {"stopReason": "end_turn"})
 
 
 def model_select(current: str) -> dict[str, Any]:
@@ -143,6 +183,8 @@ def main():
             respond(request_id, resume_session(params))
         elif method == "session/set_mode":
             respond(request_id)
+        elif method == "session/prompt":
+            prompt(request_id, params)
         elif method == "session/set_model":
             if params.get("modelId") not in MODELS:
                 respond(request_id, error={"code": -32602, "message": "Unknown model"})
