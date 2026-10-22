@@ -67,6 +67,7 @@ from openhands.sdk.agent.stream_context import (
     StreamStarted,
 )
 from openhands.sdk.context import AgentContext
+from openhands.sdk.context.soul import DEFAULT_SOUL
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.conversation.state import (
     ConversationExecutionStatus,
@@ -875,6 +876,52 @@ class TestACPAgentInitState:
 
         assert events[0].dynamic_context is not None
         assert "REGISTRY_TOKEN" in events[0].dynamic_context.text
+
+    # -- SOUL.md delivery --------------------------------------------------
+
+    @staticmethod
+    def _dynamic_context(agent: ACPAgent, state) -> str:
+        """Run init_state and return the dynamic context the ACP server gets."""
+        events: list = []
+        with patch("openhands.sdk.agent.acp_agent.ACPAgent._start_acp_server"):
+            agent.init_state(state, on_event=events.append)
+        dynamic = events[0].dynamic_context
+        return dynamic.text if dynamic is not None else ""
+
+    def test_init_state_delivers_user_soul_to_acp_server(self, tmp_path, monkeypatch):
+        """ACP only receives the dynamic tier, so SOUL.md has to arrive there."""
+        monkeypatch.setenv("OH_PERSISTENCE_DIR", str(tmp_path / "state"))
+        (tmp_path / "state").mkdir()
+        (tmp_path / "state" / "SOUL.md").write_text("You are smolpaws. Be terse.")
+        agent = _make_agent()
+
+        text = self._dynamic_context(agent, _make_state(tmp_path))
+
+        assert "<SOUL>\nYou are smolpaws. Be terse.\n</SOUL>" in text
+
+    def test_init_state_omits_soul_when_user_has_no_file(self, tmp_path, monkeypatch):
+        """The built-in default is a placeholder; shipping it is pure noise."""
+        monkeypatch.setenv("OH_PERSISTENCE_DIR", str(tmp_path / "state"))
+        agent = _make_agent()
+
+        text = self._dynamic_context(agent, _make_state(tmp_path))
+
+        assert "<SOUL>" not in text
+        assert DEFAULT_SOUL not in text
+
+    def test_init_state_omits_soul_when_a_persona_replaces_it(
+        self, tmp_path, monkeypatch
+    ):
+        """A persona replaces the soul in the static tier; ACP must match."""
+        monkeypatch.setenv("OH_PERSISTENCE_DIR", str(tmp_path / "state"))
+        (tmp_path / "state").mkdir()
+        (tmp_path / "state" / "SOUL.md").write_text("You are smolpaws. Be terse.")
+        agent = _make_agent(system_prompt_kwargs={"persona": "You are a librarian."})
+
+        text = self._dynamic_context(agent, _make_state(tmp_path))
+
+        assert "<SOUL>" not in text
+        assert "smolpaws" not in text
 
     # -- Cold-start error surfacing (issue #1024) --------------------------
 

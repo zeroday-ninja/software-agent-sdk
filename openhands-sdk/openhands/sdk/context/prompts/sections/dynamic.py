@@ -13,6 +13,7 @@ registry is replacing (proposal #2827).
 # ruff: noqa: E501
 
 from openhands.sdk.context.prompts.section import CacheTier, PromptContext
+from openhands.sdk.context.soul import render_soul_block
 
 
 __all__ = [
@@ -22,6 +23,7 @@ __all__ = [
     "DateTimeSection",
     "MemoryContextSection",
     "RepoContextSection",
+    "SoulContextSection",
 ]
 
 
@@ -40,6 +42,29 @@ class DateTimeSection:
             f"The current date and time is: {ctx.now}\n"
             "</CURRENT_DATETIME>"
         )
+
+
+class SoulContextSection:
+    """``<SOUL>`` for a runtime that only receives the dynamic tier (ACP).
+
+    The regular agent renders its identity in the static tier instead, and
+    nothing populates ``soul_context`` on that path, so the block is never
+    emitted twice. Unlike ``<REPO_CONTEXT>``/``<MEMORY_CONTEXT>`` the text is
+    not wrapped in an untrusted-content warning: it is the user's own
+    configuration, and the static tier treats it as authoritative identity --
+    telling the model to distrust it here would make the ACP rendering
+    contradict the regular one.
+    """
+
+    name = "soul_context"
+    cache_tier = CacheTier.DYNAMIC
+
+    def guard(self, ctx: PromptContext) -> bool:
+        return bool(ctx.soul_context)
+
+    def render(self, ctx: PromptContext) -> str | None:
+        assert ctx.soul_context is not None
+        return render_soul_block(ctx.soul_context)
 
 
 class RepoContextSection:

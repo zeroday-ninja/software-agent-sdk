@@ -362,6 +362,7 @@ class AgentContext(BaseModel):
         llm_model: str | None = None,
         llm_model_canonical: str | None = None,
         additional_secret_infos: list[dict[str, str | None]] | None = None,
+        soul_context: str | None = None,
     ) -> str | None:
         """Get the system message with repo skill content and custom suffix.
 
@@ -378,6 +379,10 @@ class AgentContext(BaseModel):
             additional_secret_infos: Optional list of additional secret info dicts
                 (with 'name' and 'description' keys) to merge with agent_context
                 secrets. Typically passed from conversation's secret_registry.
+            soul_context: Optional ``SOUL.md`` identity text to render as
+                ``<SOUL>`` in the dynamic tier. Only set by callers whose runtime
+                never receives the static tier (ACP); the regular agent's static
+                ``SoulSection`` already emits it.
 
         Skill categorization:
         - AgentSkills-format (SKILL.md): Always in <available_skills> (progressive
@@ -395,6 +400,7 @@ class AgentContext(BaseModel):
             available_skills_prompt=data.available_skills_prompt or None,
             custom_suffix=self.system_message_suffix or None,
             memory_context=self.memory_context or None,
+            soul_context=soul_context or None,
             secret_infos=tuple(
                 (info["name"] or "", info["description"]) for info in data.secret_infos
             ),
@@ -478,6 +484,7 @@ class AgentContext(BaseModel):
     def to_acp_prompt_context(
         self,
         additional_secret_infos: list[dict[str, str | None]] | None = None,
+        soul_context: str | None = None,
     ) -> str | None:
         """Return the AgentContext fields that ACP can consume as prompt text.
 
@@ -505,13 +512,21 @@ class AgentContext(BaseModel):
                 :meth:`get_system_message_suffix`. When provided, these secrets are
                 merged with any secrets already on the AgentContext so the rendered
                 ``<CUSTOM_SECRETS>`` block matches what the regular Agent emits.
+            soul_context: The user's ``SOUL.md`` identity text, rendered as
+                ``<SOUL>``. ACP servers own the system prompt, so the static tier
+                that carries ``<SOUL>`` for the regular agent never reaches them;
+                routing it here is the only way an ACP runtime sees it. The
+                caller decides whether a soul applies at all (``ACPAgent``
+                suppresses it for a persona and when the user has no
+                ``SOUL.md``).
         """
         self.validate_acp_compatibility()
         # No model-specific skill filtering for ACP — delegate to the shared
         # builder, whose dynamic-tier sections also emit the <CUSTOM_SECRETS>
         # block from secrets.
         return self.get_system_message_suffix(
-            additional_secret_infos=additional_secret_infos
+            additional_secret_infos=additional_secret_infos,
+            soul_context=soul_context,
         )
 
     def get_user_message_suffix(

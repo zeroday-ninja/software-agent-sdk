@@ -76,6 +76,10 @@ class PromptContext(BaseModel):
     available_skills_prompt: str | None = None
     custom_suffix: str | None = None
     memory_context: str | None = None
+    # The user's own SOUL.md identity text, routed through the dynamic tier for
+    # runtimes that never receive a static block (ACP). Left unset for the
+    # regular agent, whose static ``SoulSection`` already carries it.
+    soul_context: str | None = None
     secret_infos: tuple[tuple[str, str | None], ...] = Field(default_factory=tuple)
 
     @field_validator("template_kwargs", mode="after")

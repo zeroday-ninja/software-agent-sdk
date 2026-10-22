@@ -9,6 +9,7 @@ import pytest
 
 from openhands.sdk.agent import Agent
 from openhands.sdk.agent.base import AgentBase
+from openhands.sdk.context import AgentContext
 from openhands.sdk.context.prompts.presets import PromptPreset, create_registry
 from openhands.sdk.llm import LLM
 
@@ -156,6 +157,30 @@ def test_planning_filename_routes_through_registry() -> None:
     assert static.startswith("You are a Planning Agent")
     # Standalone composition: the default OpenHands identity must not leak in.
     assert "<SOUL>" not in static
+
+
+def test_soul_stays_in_the_static_tier_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A regular agent renders SOUL.md in the static block and only there.
+
+    ``SoulContextSection`` exists for ACP runtimes, which never receive a static
+    block; a non-ACP agent must not get the identity twice.
+    """
+    monkeypatch.setenv("OH_PERSISTENCE_DIR", str(tmp_path))
+    (tmp_path / "SOUL.md").write_text("You are smolpaws.", encoding="utf-8")
+    agent = Agent(
+        llm=_make_llm(),
+        tools=[],
+        agent_context=AgentContext(system_message_suffix="Team rules."),
+    )
+
+    blocks = create_registry().build(agent._build_prompt_context())
+
+    assert blocks.static.startswith("<SOUL>\nYou are smolpaws.\n</SOUL>")
+    assert blocks.dynamic is not None
+    assert "Team rules." in blocks.dynamic
+    assert "<SOUL>" not in blocks.dynamic
 
 
 def test_custom_security_policy_is_resolved_by_registry(tmp_path: Path) -> None:
