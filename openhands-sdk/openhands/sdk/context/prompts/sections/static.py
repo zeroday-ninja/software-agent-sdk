@@ -19,6 +19,7 @@ from openhands.sdk.context.prompts.section import (
     Platform,
     PromptContext,
 )
+from openhands.sdk.context.soul import DEFAULT_SOUL, render_soul_block
 from openhands.sdk.utils.path import get_user_persistence_dir, to_posix_path
 
 
@@ -81,14 +82,9 @@ class _StaticTextSection:
 class SoulSection(_StaticTextSection):
     name = "soul"
 
-    _DEFAULT_SOUL = (
-        "You are OpenHands agent, a helpful AI assistant that can interact"
-        " with a computer to solve tasks."
-    )
-
     def render(self, ctx: PromptContext) -> str | None:
-        soul = str(ctx.template_kwargs.get("soul_content") or self._DEFAULT_SOUL)
-        return f"<SOUL>\n{soul}\n</SOUL>"
+        soul = str(ctx.template_kwargs.get("soul_content") or DEFAULT_SOUL)
+        return render_soul_block(soul)
 
 
 class RoleSection(_StaticTextSection):

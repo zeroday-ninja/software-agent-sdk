@@ -118,6 +118,8 @@ from openhands.sdk.agent.acp_usage_limit import (
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.agent.stream_context import StreamContext
 from openhands.sdk.context import AgentContext
+from openhands.sdk.context.prompts.section import PromptContext
+from openhands.sdk.context.soul import read_user_soul
 from openhands.sdk.conversation.state import ConversationExecutionStatus
 from openhands.sdk.credential import (
     CredentialBindingError,
@@ -2657,6 +2659,9 @@ class ACPAgent(AgentBase):
     def _render_suffix(self, state: ConversationState) -> str | None:
         """Render the system suffix once, including secrets from the registry.
 
+        The suffix is the only prompt channel an ACP server exposes, so it also
+        carries the user's ``SOUL.md`` identity (see :meth:`_soul_context`).
+
         The ``<CUSTOM_SECRETS>`` block lists every secret the ACP subprocess
         will receive, so the agent knows which env vars are available without
         them being inlined in the prompt. We render it from
@@ -2683,15 +2688,16 @@ class ACPAgent(AgentBase):
             for info in state.secret_registry.get_secret_infos()
             if info.get("name") not in file_secret_names
         ]
+        soul_context = self._soul_context()
         agent_context = self.agent_context
         if agent_context is None:
             # No caller-supplied context. Only synthesize an empty one for the
-            # renderer if we actually have a registry-secret advertisement to
-            # emit — otherwise return None so we don't start injecting other
-            # parts of the empty AgentContext's defaults (current_datetime, …)
-            # that the old "agent_context is None ⇒ no suffix" rule used to
-            # suppress.
-            if not secret_infos:
+            # renderer if we actually have something to emit — a registry-secret
+            # advertisement or the user's soul — otherwise return None so we
+            # don't start injecting other parts of the empty AgentContext's
+            # defaults (current_datetime, …) that the old "agent_context is None
+            # ⇒ no suffix" rule used to suppress.
+            if not secret_infos and not soul_context:
                 return None
             agent_context = AgentContext(current_datetime=None)
         elif agent_context.secrets:
@@ -2699,7 +2705,24 @@ class ACPAgent(AgentBase):
             # clear the agent_context copy to advertise from the registry alone
             # rather than re-merging a redundant second source.
             agent_context = agent_context.model_copy(update={"secrets": {}})
-        return agent_context.to_acp_prompt_context(additional_secret_infos=secret_infos)
+        return agent_context.to_acp_prompt_context(
+            additional_secret_infos=secret_infos,
+            soul_context=soul_context,
+        )
+
+    def _soul_context(self) -> str | None:
+        """The user's ``SOUL.md`` text to deliver through the dynamic tier.
+
+        An ACP server owns its system prompt, so the static tier that carries
+        ``<SOUL>`` for the regular agent never reaches it; the dynamic tier is
+        the only channel. ``None`` when a persona is configured (matching the
+        static tier, where a persona replaces the soul) or when the user has
+        written no ``SOUL.md`` — the built-in default is a placeholder, and
+        shipping it would add a pointless identity line to every ACP session.
+        """
+        if PromptContext(template_kwargs=self.system_prompt_kwargs).persona:
+            return None
+        return read_user_soul()
 
     def _present_file_secret_names(self, state: ConversationState) -> set[str]:
         """Reserved file-content secret names supplied for this conversation.

@@ -25,6 +25,7 @@ from openhands.sdk.context.condenser import CondenserBase
 from openhands.sdk.context.prompts.presets import PromptPreset, create_registry
 from openhands.sdk.context.prompts.prompt import render_template
 from openhands.sdk.context.prompts.section import Platform, PromptContext
+from openhands.sdk.context.soul import load_soul
 from openhands.sdk.critic.base import CriticBase
 from openhands.sdk.llm import LLM
 from openhands.sdk.llm.utils.model_prompt_spec import get_model_prompt_spec
@@ -47,7 +48,6 @@ from openhands.sdk.tool.builtins.vision_inspect import (
 )
 from openhands.sdk.utils.deprecation import warn_deprecated
 from openhands.sdk.utils.models import DiscriminatedUnionMixin
-from openhands.sdk.utils.path import get_user_persistence_dir
 
 
 if TYPE_CHECKING:
@@ -59,17 +59,6 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-
-# -- SOUL.md loader -------------------------------------------------------
-# SOUL.md is the agent's identity file, ``SOUL.md`` under the user persistence
-# directory (~/.openhands/SOUL.md absent OH_PERSISTENCE_DIR).  When present it
-# replaces the default identity in the system prompt.
-
-_SOUL_PATH = get_user_persistence_dir() / "SOUL.md"
-_DEFAULT_SOUL = (
-    "You are OpenHands agent, a helpful AI assistant that can interact"
-    " with a computer to solve tasks."
-)
 
 # Built-in prompt dir. The registry only stands in for built-in prompts here; a
 # subclass with its own prompts/ keeps the Jinja render path.
@@ -85,20 +74,6 @@ _PRESET_BY_FILENAME: dict[str, PromptPreset] = {
     "system_prompt.j2": PromptPreset.DEFAULT,
     "system_prompt_planning.j2": PromptPreset.PLANNING,
 }
-
-
-def _load_soul_md() -> str:
-    """Load ``SOUL.md`` from the user persistence dir, else the built-in default."""
-    try:
-        with open(_SOUL_PATH, encoding="utf-8") as f:
-            content = f.read().strip()
-        if content:
-            return content
-    except FileNotFoundError:
-        pass
-    except Exception as exc:
-        logger.debug("Could not read SOUL.md from %s: %s", _SOUL_PATH, exc)
-    return _DEFAULT_SOUL
 
 
 class AgentBase(DiscriminatedUnionMixin, ABC):
@@ -409,7 +384,7 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
 
         # Load SOUL.md identity if not already provided
         if "soul_content" not in template_kwargs:
-            template_kwargs["soul_content"] = _load_soul_md()
+            template_kwargs["soul_content"] = load_soul()
 
         template_kwargs.setdefault(
             "memory_enabled",

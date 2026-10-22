@@ -27,6 +27,7 @@ from openhands.sdk.context.prompts.sections.dynamic import (
     DateTimeSection,
     MemoryContextSection,
     RepoContextSection,
+    SoulContextSection,
 )
 from openhands.sdk.context.prompts.sections.planning import PlanningSection
 from openhands.sdk.context.prompts.sections.static import (
@@ -108,6 +109,9 @@ _PLANNING_STATIC_SECTIONS: Final[tuple[PromptSection, ...]] = (
 )
 
 _DYNAMIC_SECTIONS: Final[tuple[PromptSection, ...]] = (
+    # Identity first, mirroring the static tier. guard: soul_context set, which
+    # only the ACP adapter does -- see SoulContextSection.
+    SoulContextSection(),
     RepoContextSection(),  # guard: gated repo skills present
     MemoryContextSection(),  # guard: resolved memory present
     AvailableSkillsSection(),  # guard: available_skills_prompt

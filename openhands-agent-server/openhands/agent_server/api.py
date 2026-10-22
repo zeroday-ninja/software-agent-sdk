@@ -85,6 +85,7 @@ from openhands.agent_server.server_details_router import (
 )
 from openhands.agent_server.settings_router import settings_router
 from openhands.agent_server.skills_router import skills_router
+from openhands.agent_server.soul_router import soul_router
 from openhands.agent_server.sub_agents_router import sub_agents_router
 from openhands.agent_server.telemetry import (
     build_telemetry_sink,
@@ -576,6 +577,7 @@ def _add_api_routes(app: FastAPI) -> None:
     api_router.include_router(file_router)
     api_router.include_router(vscode_router)
     api_router.include_router(skills_router)
+    api_router.include_router(soul_router)
     api_router.include_router(sub_agents_router)
     api_router.include_router(plugins_router)
     api_router.include_router(canvas_extensions_router)

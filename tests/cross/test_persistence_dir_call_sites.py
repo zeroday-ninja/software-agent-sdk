@@ -135,11 +135,6 @@ _IMPORT_TIME_CALL_SITES: dict[str, tuple[str, str, str]] = {
         "DEFAULT_CACHE_DIR",
         "cache/extensions",
     ),
-    "agent_soul_path": (
-        "openhands.sdk.agent.base",
-        "_SOUL_PATH",
-        "SOUL.md",
-    ),
 }
 
 # Call sites that intentionally keep a ``~/.agents`` entry ahead of the
@@ -302,6 +297,15 @@ def test_load_user_agents_reads_persistence_dir(persistence_dir: Path) -> None:
     )
     names = {a.name for a in load_user_agents()}
     assert "reviewer" in names
+
+
+def test_soul_path_uses_persistence_dir(persistence_dir: Path) -> None:
+    from openhands.sdk.context.soul import get_soul_path, read_user_soul
+
+    assert get_soul_path() == persistence_dir / "SOUL.md"
+    persistence_dir.mkdir(parents=True, exist_ok=True)
+    (persistence_dir / "SOUL.md").write_text("You are smolpaws.")
+    assert read_user_soul() == "You are smolpaws."
 
 
 def test_load_memory_reads_user_index(persistence_dir: Path) -> None:

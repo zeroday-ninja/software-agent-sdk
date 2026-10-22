@@ -22,8 +22,8 @@ from uuid import uuid4
 import pytest
 
 from openhands.sdk.agent import Agent
-from openhands.sdk.agent.base import _DEFAULT_SOUL
 from openhands.sdk.context.agent_context import AgentContext
+from openhands.sdk.context.soul import DEFAULT_SOUL
 from openhands.sdk.conversation.state import ConversationState
 from openhands.sdk.llm import LLM
 from openhands.sdk.skills import Skill
@@ -111,7 +111,7 @@ def _build_agent(cell: Cell) -> Agent:
             # Pin soul_content to the built-in default so snapshots are
             # deterministic regardless of whether ~/.openhands/SOUL.md exists
             # on the machine running the tests.
-            "soul_content": _DEFAULT_SOUL,
+            "soul_content": DEFAULT_SOUL,
         },
     )
 
@@ -185,7 +185,7 @@ def test_soul_default_snapshot(tmp_path: Path) -> None:
     agent = Agent(
         llm=llm,
         tools=[],
-        system_prompt_kwargs={"soul_content": _DEFAULT_SOUL},
+        system_prompt_kwargs={"soul_content": DEFAULT_SOUL},
     )
     _check_snapshot("soul__default", agent.static_system_message)
 
