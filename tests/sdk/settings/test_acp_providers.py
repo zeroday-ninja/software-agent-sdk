@@ -42,8 +42,28 @@ class TestACPProviderInfo:
             assert isinstance(info, ACPProviderInfo)
 
     def test_default_commands_prefer_offline_cache(self):
+        """Providers that are npm packages fetch from the cache first.
+
+        Not every provider is one: a runtime with no protocol server of its
+        own is launched through an adapter in this repository, which has
+        nothing to fetch.
+        """
         for info in ACP_PROVIDERS.values():
+            if info.default_command[0] != "npx":
+                continue
             assert info.default_command[:3] == ("npx", "-y", "--prefer-offline")
+
+    def test_a_provider_without_an_npm_package_runs_an_adapter_from_here(self):
+        """Antigravity has no protocol mode, so we ship the server.
+
+        Worth pinning: if this ever becomes an ``npx`` command, something has
+        silently taken a dependency on a third-party wrapper.
+        """
+        info = ACP_PROVIDERS["antigravity"]
+        assert info.default_command[1:] == (
+            "-m",
+            "openhands.sdk.acp_servers.antigravity",
+        )
 
     def test_claude_code_metadata(self):
         info = ACP_PROVIDERS["claude-code"]

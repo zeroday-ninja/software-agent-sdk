@@ -127,14 +127,38 @@ class TestACPInstallCatalogMatchesACPProviders:
     verify the two stay in lockstep for every npm-installable provider."""
 
     def test_catalog_keys_match_registered_npm_providers(self):
-        assert set(ACP_INSTALL_CATALOG) == set(ACP_PROVIDERS)
+        """The catalog covers every provider that is an npm package.
+
+        A provider whose server this repository ships itself is deliberately
+        absent: there is no package to pin, and inventing a catalog entry for
+        it would make the image build try to install something that does not
+        exist.
+        """
+        assert set(ACP_INSTALL_CATALOG) <= set(ACP_PROVIDERS)
+        missing = {
+            key
+            for key, info in ACP_PROVIDERS.items()
+            if info.default_command[0] == "npx" and key not in ACP_INSTALL_CATALOG
+        }
+        assert missing == set()
 
     def test_default_commands_are_derived_from_catalog(self):
+        """Every provider that *is* an npm package launches the pinned one.
+
+        The catalog exists so a version is pinned in one place and the sandbox
+        image and the launch command cannot drift. A provider with no npm
+        package has nothing to pin, and is checked in the provider tests
+        instead.
+        """
         for key, info in ACP_PROVIDERS.items():
+            if key not in ACP_INSTALL_CATALOG:
+                continue
             assert info.default_command == ACP_INSTALL_CATALOG[key].npx_command()
 
     def test_binary_names_are_derived_from_catalog(self):
         for key, info in ACP_PROVIDERS.items():
+            if key not in ACP_INSTALL_CATALOG:
+                continue
             assert info.binary_name == ACP_INSTALL_CATALOG[key].binary_name
 
     def test_pinned_versions_unchanged(self):
