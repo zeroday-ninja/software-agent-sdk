@@ -11,7 +11,10 @@ from typing import Any, Final, TypeGuard, cast
 from pydantic import ValidationError
 
 from openhands.sdk.agent.acp_agent import ACPAgent, merge_agent_state
-from openhands.sdk.agent.acp_usage_limit import ACPUsageLimitError
+from openhands.sdk.agent.acp_usage_limit import (
+    ACPUsageLimitError,
+    parse_reset_hint,
+)
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.agent.stream_context import StreamProgressCallbackType
 from openhands.sdk.context.condenser import CondenserBase, LLMSummarizingCondenser
@@ -41,6 +44,7 @@ from openhands.sdk.conversation.visualizer import (
 )
 from openhands.sdk.credential import CredentialBindingError
 from openhands.sdk.event import (
+    ACPRuntimeSwitchEvent,
     ActionEvent,
     AgentErrorEvent,
     CondensationRequest,
@@ -149,6 +153,10 @@ ACP_RUNTIME_STATE_KEYS: tuple[str, ...] = (
 # Set by a usage-limit failover: the registry key of the runtime that was
 # replaced, for clients that want to show where the conversation came from.
 ACP_FAILOVER_FROM_KEY = "acp_failover_from"
+# Every runtime this conversation has seen exhausted, oldest first. The chain
+# refuses to re-enter one, which is what makes two runtimes pointed at each
+# other stop instead of ping-ponging for as long as the run lasts.
+ACP_FAILOVER_TRIED_KEY = "acp_failover_tried"
 
 ASK_AGENT_LLM_USAGE_ID: Final[str] = "ask-agent-llm"
 
@@ -188,6 +196,29 @@ def _acp_runtime_label(acp_server: str | None) -> str:
     """Display name for an ACP provider key, or the key itself."""
     info = get_acp_provider(acp_server) if acp_server else None
     return info.display_name if info is not None else (acp_server or "The ACP agent")
+
+
+def _next_acp_fallback(
+    old_agent: ACPAgent, acp_server: str
+) -> tuple[str | None, str | None]:
+    """The fallback runtime and model a replacement for ``acp_server`` carries.
+
+    The configured fallback carries straight over, so a runtime reached by a
+    manual switch can still fail over. When the replacement *is* that
+    configured fallback, the only hop the chain has left is back to the runtime
+    being replaced, so it points there and the chain becomes a cycle that
+    ``ACP_FAILOVER_TRIED_KEY`` terminates.
+
+    A ``custom`` runtime drops out of the chain: its launch command is not in
+    the provider registry, so nothing could relaunch it from a key alone.
+    """
+    configured = old_agent.acp_fallback_server
+    if configured and configured != acp_server:
+        return configured, old_agent.acp_fallback_model
+    previous = old_agent.acp_server
+    if not previous or get_acp_provider(previous) is None:
+        return None, None
+    return previous, old_agent.acp_model
 
 
 def _is_acp_prompt_message(event: Event) -> TypeGuard[MessageEvent]:
@@ -1793,37 +1824,49 @@ class LocalConversation(BaseConversation):
                 "switch_acp_server is only supported for ACP conversations."
             )
         with self._state:
+            previous = self.agent.acp_server or "custom"
             self._replace_acp_agent(
                 acp_server, model, acp_command=acp_command, failover_from=None
             )
+            self._on_event(
+                ACPRuntimeSwitchEvent(
+                    from_server=previous,
+                    to_server=acp_server,
+                    to_model=model,
+                    reason="manual",
+                )
+            )
 
     def _fail_over_acp(self, error: ACPUsageLimitError) -> bool:
-        """Switch to the agent's fallback runtime after a usage-limit failure.
+        """Switch to the next unexhausted runtime in the failover chain.
 
-        Returns True once the fallback runtime is live and the loop may prompt
-        again. Returns False when no fallback applies, or starting it failed;
-        the start failure is already surfaced as a ``ConversationErrorEvent``
-        with the conversation in ``ERROR``, so the caller re-raises ``error``.
+        Returns True once that runtime is live and the loop may prompt again.
+        Returns False when the chain has nowhere left to go, or starting the
+        next runtime failed; both are already surfaced as a
+        ``ConversationErrorEvent`` with the conversation in ``ERROR``, so the
+        caller re-raises ``error``.
         """
         agent = self.agent
-        if (
-            not isinstance(agent, ACPAgent)
-            or not agent.acp_fallback_server
-            or agent.acp_fallback_server == agent.acp_server
-        ):
+        if not isinstance(agent, ACPAgent):
             return False
-        target = agent.acp_fallback_server
-        model = agent.acp_fallback_model
         with self._state:
+            current = agent.acp_server or "custom"
+            tried = self._acp_runtimes_tried()
+            if current not in tried:
+                tried = (*tried, current)
+            target = agent.acp_fallback_server
+            if not target or target == current or target in tried:
+                self._end_acp_failover_chain(error, tried)
+                return False
+            model = agent.acp_fallback_model
+            hint = parse_reset_hint(error.detail)
             notice = (
-                f"{_acp_runtime_label(agent.acp_server)} reached its usage limit: "
+                f"{_acp_runtime_label(current)} reached its usage limit: "
                 f"{error.detail}\n\n"
                 f"Switching to {_acp_runtime_label(target)}"
                 f"{f' ({model})' if model else ''} and continuing."
             )
-            logger.warning(
-                "ACP usage limit on %s; failing over to %s", agent.acp_server, target
-            )
+            logger.warning("ACP usage limit on %s; failing over to %s", current, target)
             self._on_event(
                 MessageEvent(
                     source="agent",
@@ -1837,7 +1880,8 @@ class LocalConversation(BaseConversation):
                     target,
                     model,
                     acp_command=None,
-                    failover_from=agent.acp_server or "custom",
+                    failover_from=current,
+                    tried=tried,
                 )
             except Exception as e:
                 logger.error("ACP failover to %s failed: %s", target, e)
@@ -1853,7 +1897,69 @@ class LocalConversation(BaseConversation):
                         )
                     )
                 return False
+            self._on_event(
+                ACPRuntimeSwitchEvent(
+                    from_server=current,
+                    to_server=target,
+                    to_model=model,
+                    reason="usage_limit",
+                    detail=error.detail,
+                    reset_hint=hint,
+                )
+            )
         return True
+
+    def _acp_runtimes_tried(self) -> tuple[str, ...]:
+        """Runtimes this conversation has already seen refuse on a usage limit.
+
+        Ordered oldest first, so the chain-exhausted message reads as the route
+        the conversation actually took.
+        """
+        recorded = self._state.agent_state.get(ACP_FAILOVER_TRIED_KEY)
+        if not isinstance(recorded, list):
+            return ()
+        return tuple(key for key in recorded if isinstance(key, str))
+
+    def _end_acp_failover_chain(
+        self, error: ACPUsageLimitError, tried: tuple[str, ...]
+    ) -> None:
+        """Surface that every runtime the chain can reach is exhausted.
+
+        Must be called with the state lock held. The last runtime's own refusal
+        is not the story once the whole chain is spent -- a user told only
+        "you've hit your limit" would reasonably switch to the fallback that
+        has already been tried -- so the event names the runtimes instead and
+        keeps the raw notice as supporting detail.
+
+        ``source="agent"`` marks this as the typed, detailed error for the
+        failure, which stops ``run()``'s generic handler from appending a
+        ``str(error)`` duplicate that would clobber it as the latest error.
+        """
+        hint = parse_reset_hint(error.detail)
+        labels = ", ".join(_acp_runtime_label(key) for key in tried)
+        reset = (
+            f" {_acp_runtime_label(tried[-1])} reports it resets at "
+            f"{hint.at.isoformat()}."
+            if hint.at is not None
+            else ""
+        )
+        self._state.agent_state = {
+            **self._state.agent_state,
+            ACP_FAILOVER_TRIED_KEY: list(tried),
+        }
+        self._state.execution_status = ConversationExecutionStatus.ERROR
+        logger.warning("ACP failover chain exhausted after trying %s", labels)
+        self._on_event(
+            ConversationErrorEvent(
+                source="agent",
+                code="ACPUsageLimitChainExhausted",
+                detail=(
+                    "Every ACP runtime in the failover chain has reached its "
+                    f"usage limit: {labels}.{reset} The last refusal was: "
+                    f"{error.detail}"
+                )[:500],
+            )
+        )
 
     def _replace_acp_agent(
         self,
@@ -1862,6 +1968,7 @@ class LocalConversation(BaseConversation):
         *,
         acp_command: Sequence[str] | None,
         failover_from: str | None,
+        tried: tuple[str, ...] = (),
     ) -> ACPAgent:
         """Build, persist, and start a new ACP agent for ``acp_server``.
 
@@ -1871,14 +1978,23 @@ class LocalConversation(BaseConversation):
         leave ``agent_state`` so the new agent cannot try to resume a session
         the new server never had; the new agent's first prompt carries the
         rendered history instead.
+
+        ``tried`` is the failover chain's visited set, recorded in
+        ``agent_state`` so the next hop can see it; a manual switch passes none
+        and clears it.
         """
         from openhands.sdk.settings.model import ACPAgentSettings
 
         old_agent = self.agent
         assert isinstance(old_agent, ACPAgent)
+        fallback_server, fallback_model = _next_acp_fallback(old_agent, acp_server)
         settings_kwargs: dict[str, Any] = {
             "acp_server": acp_server,
             "acp_model": model,
+            # The replacement needs a chain of its own: without one, the next
+            # exhaustion has nowhere to go and ends the conversation.
+            "acp_fallback_server": fallback_server,
+            "acp_fallback_model": fallback_model,
             "acp_prompt_timeout": old_agent.acp_prompt_timeout,
             "acp_startup_timeout": old_agent.acp_startup_timeout,
             "acp_isolate_data_dir": old_agent.acp_isolate_data_dir,
@@ -1913,8 +2029,12 @@ class LocalConversation(BaseConversation):
         }
         if failover_from is not None:
             agent_state[ACP_FAILOVER_FROM_KEY] = failover_from
+            agent_state[ACP_FAILOVER_TRIED_KEY] = list(tried)
         else:
+            # A manual switch is the user restarting the chain, and an exhausted
+            # window reopens with time, so the old route stops applying.
             agent_state.pop(ACP_FAILOVER_FROM_KEY, None)
+            agent_state.pop(ACP_FAILOVER_TRIED_KEY, None)
         self._state.agent_state = agent_state
         new_agent._bootstrap_transcript = render_resume_transcript(
             list(self._state.active_branch())
