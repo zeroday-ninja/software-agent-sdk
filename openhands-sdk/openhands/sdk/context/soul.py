@@ -18,6 +18,7 @@ from openhands.sdk.context.identity import (
     identity_document_path,
     legacy_soul_path,
     read_identity_document,
+    read_identity_prompt,
 )
 from openhands.sdk.logger import get_logger
 
@@ -67,8 +68,14 @@ def read_user_soul() -> str | None:
 
 
 def load_soul() -> str:
-    """The user's identity text, falling back to :data:`DEFAULT_SOUL`."""
-    return read_user_soul() or DEFAULT_SOUL
+    """The user's identity, falling back to :data:`DEFAULT_SOUL`.
+
+    The whole document set, not only ``SOUL.md``: how someone writes and what
+    has already been established with them change an answer at least as much
+    as who they are, and a set that can be edited but never reaches a prompt
+    is a settings page that lies.
+    """
+    return read_identity_prompt() or DEFAULT_SOUL
 
 
 def render_soul_block(soul: str) -> str:

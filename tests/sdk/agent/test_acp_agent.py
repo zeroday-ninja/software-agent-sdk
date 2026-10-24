@@ -751,7 +751,14 @@ class TestACPAgentInitState:
         assert "ACP server" in events[0].system_prompt.text
         assert events[0].tools == []
 
-    def test_init_state_no_dynamic_context_without_agent_context(self, tmp_path):
+    def test_init_state_no_dynamic_context_without_agent_context(
+        self, tmp_path, monkeypatch
+    ):
+        # The dynamic context also carries the user's identity, which is read
+        # from the persistence directory — so without pointing that somewhere
+        # empty this asserts something about the machine running the test
+        # rather than about the agent.
+        monkeypatch.setenv("OH_PERSISTENCE_DIR", str(tmp_path / "state"))
         agent = _make_agent()
         state = _make_state(tmp_path)
         events: list = []

@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from openhands.sdk.context.identity import IDENTITY_BUDGET_CHARS
 from openhands.sdk.context.soul import (
     DEFAULT_SOUL,
     get_soul_path,
@@ -100,3 +101,76 @@ def test_a_soul_written_before_the_set_existed_is_still_read(
     # Act / Assert
     assert read_user_soul() == "I am who I was."
     assert get_soul_path() == tmp_path / "SOUL.md"
+
+
+def test_the_whole_set_reaches_the_prompt_in_load_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A set that can be edited but never reaches a prompt is a settings page
+    that lies."""
+    # Arrange
+    monkeypatch.setenv("OH_PERSISTENCE_DIR", str(tmp_path))
+    identity = tmp_path / "soul"
+    (identity / "examples").mkdir(parents=True)
+    (identity / "SOUL.md").write_text("I build tools for myself.\n")
+    (identity / "STYLE.md").write_text("Short sentences. No hedging.\n")
+    (identity / "MEMORY.md").write_text("Decided: fork, never upstream.\n")
+    (identity / "examples" / "good-outputs.md").write_text("Like this.\n")
+
+    # Act
+    rendered = load_soul()
+
+    # Assert: identity first, then voice, then what was established, then
+    # calibration — and the headings say which is which.
+    assert rendered.index("I build tools") < rendered.index("How I write")
+    assert rendered.index("How I write") < rendered.index("already established")
+    assert rendered.index("already established") < rendered.index("sounds like me")
+    assert "fork, never upstream" in rendered
+
+
+def test_a_set_with_only_a_soul_renders_exactly_that_document(
+    soul_path: Path,
+) -> None:
+    """Every install that predates the set has exactly this, and must read the
+    same as it did before."""
+    # Arrange
+    soul_path.write_text("I build tools for myself.\n")
+
+    # Act / Assert: no headings, no scaffolding, just the document.
+    assert load_soul() == "I build tools for myself."
+
+
+def test_identity_stays_inside_its_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Arrange: far more identity than a prompt can afford.
+    monkeypatch.setenv("OH_PERSISTENCE_DIR", str(tmp_path))
+    identity = tmp_path / "soul"
+    identity.mkdir(parents=True)
+    (identity / "SOUL.md").write_text("S" * 40000)
+    (identity / "STYLE.md").write_text("T" * 40000)
+    (identity / "MEMORY.md").write_text("M" * 40000)
+
+    # Act
+    rendered = load_soul()
+
+    # Assert: identity is context and the task is the task.
+    assert len(rendered) <= IDENTITY_BUDGET_CHARS + 500
+    assert "[truncated]" in rendered
+
+
+def test_a_long_memory_keeps_what_was_learned_most_recently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Arrange
+    monkeypatch.setenv("OH_PERSISTENCE_DIR", str(tmp_path))
+    identity = tmp_path / "soul"
+    identity.mkdir(parents=True)
+    (identity / "MEMORY.md").write_text("x" * 20000 + "\nlearned this today\n")
+
+    # Act
+    rendered = load_soul()
+
+    # Assert: the oldest thing someone learned is rarely the most relevant.
+    assert "learned this today" in rendered
+    assert "earlier entries omitted" in rendered
