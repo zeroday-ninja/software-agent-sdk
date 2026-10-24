@@ -25,7 +25,11 @@ from openhands.sdk.context.soul import (
 def soul_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """``OH_PERSISTENCE_DIR`` pointed at a clean tempdir, plus the soul path."""
     monkeypatch.setenv("OH_PERSISTENCE_DIR", str(tmp_path))
-    yield tmp_path / "SOUL.md"
+    # SOUL.md is one document in a set now, so a fresh install writes it under
+    # `soul/`. The legacy location is still read; that has its own test.
+    soul = tmp_path / "soul" / "SOUL.md"
+    soul.parent.mkdir(parents=True, exist_ok=True)
+    yield soul
 
 
 def test_soul_path_follows_the_persistence_dir(soul_path: Path) -> None:
@@ -79,3 +83,20 @@ def test_unreadable_file_falls_back_to_the_default(soul_path: Path) -> None:
 
     assert read_user_soul() is None
     assert load_soul() == DEFAULT_SOUL
+
+
+def test_a_soul_written_before_the_set_existed_is_still_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An install that predates the set keeps working untouched.
+
+    Reads fall back to the old path, so nobody has to migrate anything to keep
+    the identity they already wrote.
+    """
+    # Arrange
+    monkeypatch.setenv("OH_PERSISTENCE_DIR", str(tmp_path))
+    (tmp_path / "SOUL.md").write_text("I am who I was.\n")
+
+    # Act / Assert
+    assert read_user_soul() == "I am who I was."
+    assert get_soul_path() == tmp_path / "SOUL.md"

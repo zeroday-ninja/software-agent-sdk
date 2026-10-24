@@ -13,8 +13,13 @@ the agent-server endpoint) resolves one location.
 from pathlib import Path
 from typing import Final
 
+from openhands.sdk.context.identity import (
+    IDENTITY_DOCUMENTS,
+    identity_document_path,
+    legacy_soul_path,
+    read_identity_document,
+)
 from openhands.sdk.logger import get_logger
-from openhands.sdk.utils.path import get_user_persistence_dir
 
 
 logger = get_logger(__name__)
@@ -34,8 +39,21 @@ DEFAULT_SOUL: Final[str] = (
 
 
 def get_soul_path() -> Path:
-    """Absolute path of the user's ``SOUL.md``."""
-    return get_user_persistence_dir() / "SOUL.md"
+    """Absolute path of the user's ``SOUL.md``.
+
+    ``SOUL.md`` is now one document in a set under ``soul/`` (see
+    :mod:`openhands.sdk.context.identity`), but an install that predates the set
+    has it at the old location and nothing has written since. So: the set's copy
+    when it exists, the old path otherwise. The first write moves the old file
+    into the set, which is what keeps there from being two files where only one
+    is read.
+    """
+    document = IDENTITY_DOCUMENTS[0]
+    in_set = identity_document_path(document)
+    if in_set.exists():
+        return in_set
+    legacy = legacy_soul_path()
+    return legacy if legacy.exists() else in_set
 
 
 def read_user_soul() -> str | None:
@@ -45,15 +63,7 @@ def read_user_soul() -> str | None:
     callers that must not emit the built-in placeholder (ACP runtimes, a settings
     UI showing whether the user has customized anything) can tell the two apart.
     """
-    path = get_soul_path()
-    try:
-        content = path.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        return None
-    except (OSError, UnicodeDecodeError) as exc:
-        logger.debug("Could not read SOUL.md from %s: %s", path, exc)
-        return None
-    return content or None
+    return read_identity_document(IDENTITY_DOCUMENTS[0])
 
 
 def load_soul() -> str:
