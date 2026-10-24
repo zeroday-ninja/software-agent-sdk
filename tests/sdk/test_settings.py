@@ -406,6 +406,9 @@ def test_export_agent_settings_schema_emits_variant_tagged_sections() -> None:
         "kimi-code",
         "pi",
         "opencode",
+        # No npm package: its CLI has no protocol mode, so the default
+        # command runs this repository's own adapter.
+        "antigravity",
         "custom",
     }
 

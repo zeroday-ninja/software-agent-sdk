@@ -1316,13 +1316,22 @@ class ConversationSettings(BaseModel):
 
 
 ACPServerKind = Literal[
-    "claude-code", "codex", "gemini-cli", "kimi-code", "pi", "opencode", "custom"
+    "claude-code",
+    "codex",
+    "gemini-cli",
+    "kimi-code",
+    "pi",
+    "opencode",
+    "antigravity",
+    "custom",
 ]
 """Known ACP backend servers the GUI can pick from.
 
-``custom`` means the user supplies the raw ``acp_command`` themselves;
-the other choices map to a default npx command stored in
-:data:`~openhands.sdk.settings.acp_providers.ACP_PROVIDERS`.
+``custom`` means the user supplies the raw ``acp_command`` themselves; the
+other choices map to a default command stored in
+:data:`~openhands.sdk.settings.acp_providers.ACP_PROVIDERS`. Most of those are
+``npx`` invocations of someone else's package. ``antigravity`` is not: its CLI
+has no protocol mode, so the default command runs this project's own adapter.
 """
 
 

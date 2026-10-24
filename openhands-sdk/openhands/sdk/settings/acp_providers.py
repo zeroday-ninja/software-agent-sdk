@@ -36,6 +36,7 @@ client to every upstream addition.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
@@ -427,6 +428,24 @@ _CODEX_MODELS: tuple[ACPModelOption, ...] = (
     ACPModelOption(id="gpt-5.5", label="GPT-5.5"),
 )
 
+#: What ``agy models`` reports. Each model is offered at three reasoning
+#: efforts, which the CLI spells into the model id rather than as a separate
+#: setting — so they are listed as distinct models here.
+_ANTIGRAVITY_MODELS = (
+    ACPModelOption(id="gemini-4-argon-high", label="Gemini 4 Argon (High)"),
+    ACPModelOption(id="gemini-4-argon-medium", label="Gemini 4 Argon (Medium)"),
+    ACPModelOption(id="gemini-4-argon-low", label="Gemini 4 Argon (Low)"),
+    ACPModelOption(id="gemini-3.8-flash-high", label="Gemini 3.8 Flash (High)"),
+    ACPModelOption(id="gemini-3.8-flash-medium", label="Gemini 3.8 Flash (Medium)"),
+    ACPModelOption(id="gemini-3.8-flash-low", label="Gemini 3.8 Flash (Low)"),
+    ACPModelOption(id="claude-opus-5-5-high", label="Claude Opus 5.5 (High)"),
+    ACPModelOption(id="claude-opus-5-5-medium", label="Claude Opus 5.5 (Medium)"),
+    ACPModelOption(id="claude-opus-5-5-low", label="Claude Opus 5.5 (Low)"),
+    ACPModelOption(id="claude-sonnet-5-5-high", label="Claude Sonnet 5.5 (High)"),
+    ACPModelOption(id="claude-sonnet-5-5-medium", label="Claude Sonnet 5.5 (Medium)"),
+    ACPModelOption(id="claude-sonnet-5-5-low", label="Claude Sonnet 5.5 (Low)"),
+)
+
 # Model IDs accepted by ``@google/gemini-cli --acp``. Mirrors the
 # ``availableModels`` the CLI reports at ``session/new`` on the pinned version
 # (gemini-cli 0.46.0). ``auto`` delegates version selection to the CLI's
@@ -603,6 +622,37 @@ ACP_PROVIDERS: Mapping[str, ACPProviderInfo] = MappingProxyType(
             file_secrets=_CODEX_FILE_SECRETS,
             binary_name=ACP_INSTALL_CATALOG["codex"].binary_name,
             data_dir_env_var="CODEX_HOME",
+        ),
+        "antigravity": ACPProviderInfo(
+            key="antigravity",
+            display_name="Antigravity",
+            # Our own adapter, not a package: Antigravity has no protocol mode
+            # and every community wrapper is an unofficial dependency on a
+            # tool that may ship its own support tomorrow. See
+            # ``openhands.sdk.acp_servers.antigravity`` for the stream format
+            # it translates, which was learned by running the CLI.
+            default_command=(
+                sys.executable,
+                "-m",
+                "openhands.sdk.acp_servers.antigravity",
+            ),
+            # The CLI carries its own Google login; there is no key to pass.
+            api_key_env_var=None,
+            base_url_env_var=None,
+            # The adapter auto-approves inside a sandbox, where nobody is
+            # there to answer a prompt, so no mode has to be set.
+            default_session_mode=None,
+            agent_name_patterns=("antigravity", "agy"),
+            supports_set_session_model=False,
+            supports_runtime_model_switch=False,
+            session_meta_key=None,
+            available_models=_ANTIGRAVITY_MODELS,
+            # The CLI's own default. Naming one here would pin a snapshot and
+            # bypass whatever routing Antigravity does for itself.
+            default_model=None,
+            # The CLI keeps its login under ``~/.gemini``, so only HOME moves
+            # its state — the same constraint Gemini CLI has.
+            data_dir_env_var="HOME",
         ),
         "gemini-cli": ACPProviderInfo(
             key="gemini-cli",
@@ -806,12 +856,21 @@ def detect_acp_provider_by_command(
     known provider (e.g. data-dir isolation) safely no-op.
     """
     bases: list[str] = []
+    previous = ""
     for token in command:
         base = token.rsplit("/", 1)[-1].lower()
         at = base.rfind("@")
         if at > 0:  # strip a trailing @version pin (not a leading @scope)
             base = base[:at]
+        # A provider whose server is a Python module rather than an npm
+        # package is named by its dotted import path, and the last segment is
+        # the thing to match on. Keyed off the preceding ``-m`` rather than
+        # off the dot, because a version pin has dots too — reading
+        # ``opencode-acp@0.1.2`` as a module path leaves you matching "2".
+        if previous == "-m" and "." in base:
+            base = base.rsplit(".", 1)[-1]
         bases.append(base)
+        previous = token
     for info in ACP_PROVIDERS.values():
         if any(
             base.startswith(pat) for base in bases for pat in info.agent_name_patterns
