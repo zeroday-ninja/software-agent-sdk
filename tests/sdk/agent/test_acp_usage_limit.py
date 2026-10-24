@@ -39,6 +39,14 @@ CODEX_NOTICE = (
     "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage"
 )
 # 08:00 in America/New_York, so both notices above still reset later today.
+#: Captured verbatim from `agy --print` on an exhausted account. Antigravity
+#: states the reset as a duration, which is the only machine-readable reset any
+#: of these runtimes gives.
+ANTIGRAVITY_NOTICE = (
+    "RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade "
+    "your subscription to increase your limits. Resets in 132h9m47s."
+)
+
 MORNING = datetime(2026, 10, 24, 12, 0, tzinfo=UTC)
 
 
@@ -117,9 +125,38 @@ def test_a_reset_time_without_a_zone_is_read_locally_and_says_so() -> None:
 
 
 @pytest.mark.parametrize(
+    ("notice", "ahead"),
+    [
+        # The compact form the CLI actually prints: no separator between a
+        # unit and the next number, which is where a word-boundary rule fails.
+        (ANTIGRAVITY_NOTICE, timedelta(hours=132, minutes=9, seconds=47)),
+        ("Rate limit reached; resets in 45m", timedelta(minutes=45)),
+        (
+            "Quota exceeded, resets in 2 hours 30 minutes",
+            timedelta(hours=2, minutes=30),
+        ),
+    ],
+)
+def test_a_reset_stated_as_a_duration_is_exact_from_when_it_was_read(
+    notice: str, ahead: timedelta
+) -> None:
+    hint = parse_reset_hint(notice, now=MORNING)
+
+    # Exact with no zone involved: a duration is anchored to the instant it
+    # was read, so there is nothing to be wrong about.
+    assert hint.at == MORNING + ahead
+    assert hint.confidence == "exact"
+
+
+@pytest.mark.parametrize(
     "text",
     [
         CODEX_NOTICE,
+        # A duration no usage window could plausibly have: acting on it would
+        # park a runtime for weeks on a misparse.
+        "Quota exceeded, resets in 90 days",
+        # "m" followed by a letter is a month, not a minute.
+        "Quota exceeded, resets in 3 months",
         "Internal error: {'codexErrorInfo': 'usageLimitExceeded'}",
         "The retry counter resets 3 times an hour",
         "You've hit your limit · resets 25pm (America/New_York)",
