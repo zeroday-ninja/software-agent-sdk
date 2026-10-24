@@ -13,11 +13,20 @@ is exhausted. Each reports it differently:
 :class:`ACPUsageLimitError` is how :class:`~openhands.sdk.agent.ACPAgent`
 hands such a failure to the conversation when a fallback runtime is
 configured, so the conversation can switch runtime instead of ending in error.
+
+Claude Code's notice also says when the window reopens. :func:`parse_reset_hint`
+reads that out as a :class:`ResetHint` so clients can say "back at 3pm" instead
+of re-parsing the prose.
 """
 
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime, timedelta
+from typing import Literal
+from zoneinfo import ZoneInfo
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # Text markers (casefolded) that identify an exhausted usage window. Kept
@@ -83,6 +92,131 @@ def response_indicates_usage_limit(text: str | None) -> bool:
         return False
     folded = stripped.casefold()
     return any(folded.startswith(marker) for marker in USAGE_LIMIT_MARKERS)
+
+
+ResetConfidence = Literal["exact", "approximate", "unknown"]
+"""How much a :class:`ResetHint` can be trusted. See :attr:`ResetHint.confidence`."""
+
+
+class ResetHint(BaseModel):
+    """When an exhausted ACP runtime says its usage window reopens.
+
+    A pydantic model rather than a dataclass because this rides along on
+    :class:`~openhands.sdk.event.acp_runtime_switch.ACPRuntimeSwitchEvent` into
+    the persisted event log and from there into the Agent Server's OpenAPI
+    contract, which only serialises pydantic models.
+
+    The default instance is the "we could not read a reset time" answer: that is
+    a different statement from "there is no limit", so it is still a hint, with
+    :attr:`at` unset.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    at: datetime | None = Field(
+        default=None,
+        description=(
+            "UTC instant the usage window is expected to reopen, always in the "
+            "future of when it was parsed. None means the notice carried no "
+            "time this parser could read -- never that there is no limit."
+        ),
+    )
+    source: str = Field(
+        default="",
+        description=(
+            "Verbatim fragment the time was read from, for example "
+            "'resets 3pm (America/New_York)'. Empty when nothing matched, so a "
+            "client can show the runtime's own words rather than only an "
+            "instant it has to re-render."
+        ),
+    )
+    confidence: ResetConfidence = Field(
+        default="unknown",
+        description=(
+            "'exact' when the notice named a time zone, so 'at' is a true "
+            "instant; 'approximate' when it gave a bare wall-clock time that "
+            "was read in the host's local zone and may be off by the "
+            "difference; 'unknown' when 'at' is None."
+        ),
+    )
+
+
+# Claude Code appends the reset time to its notice: "... · resets 3pm
+# (America/New_York)", "... · resets 1:30pm". Anchoring on "reset" is what keeps
+# a time mentioned elsewhere in a longer message from being read as one.
+_RESET_TIME_RE = re.compile(
+    r"""reset(?:s|ting)?\s+(?:at\s+)?
+        (?P<hour>\d{1,2})
+        (?::(?P<minute>\d{2}))?
+        \s*(?P<meridiem>[ap]\.?m\.?)?
+        (?:\s*\(\s*(?P<zone>[A-Za-z][A-Za-z0-9_+-]*(?:/[A-Za-z0-9_+-]+)*)\s*\))?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _hour_24(hour_text: str, meridiem: str | None) -> int | None:
+    """``hour_text`` as a 0-23 hour, or None when it is not an hour at all."""
+    hour = int(hour_text)
+    if meridiem:
+        if not 1 <= hour <= 12:
+            return None
+        return (hour % 12) + (12 if meridiem[0].lower() == "p" else 0)
+    return hour if 0 <= hour <= 23 else None
+
+
+def _named_zone(name: str | None) -> ZoneInfo | None:
+    """The notice's zone, or None when it named none or named one we lack."""
+    if not name:
+        return None
+    try:
+        return ZoneInfo(name)
+    except (KeyError, ValueError):
+        # A zone this host has no data for is no more useful than no zone at
+        # all; the caller falls back to local time and lowers its confidence.
+        return None
+
+
+def parse_reset_hint(text: str | None, *, now: datetime | None = None) -> ResetHint:
+    """Read the reset time out of a usage-limit notice.
+
+    Never raises: an unreadable or absent time comes back as a hint with
+    :attr:`~ResetHint.at` unset, so a caller can tell "the window reopens then"
+    apart from "we do not know when it reopens".
+
+    ``now`` is the instant the "next occurrence" rule is measured from; it
+    exists so that rule is testable and defaults to the current UTC instant.
+    """
+    if not text:
+        return ResetHint()
+    match = _RESET_TIME_RE.search(text)
+    if match is None:
+        return ResetHint()
+    minute_text = match.group("minute")
+    meridiem = match.group("meridiem")
+    if minute_text is None and meridiem is None:
+        # A bare number after "resets" is a count, not a clock: "resets 3
+        # times" must not become 03:00.
+        return ResetHint()
+    hour = _hour_24(match.group("hour"), meridiem)
+    minute = int(minute_text or 0)
+    if hour is None or minute > 59:
+        return ResetHint()
+
+    zone = _named_zone(match.group("zone"))
+    # astimezone(None) is local time, which is the best available reading of a
+    # wall-clock time the runtime gave without a zone.
+    reference = (now or datetime.now(UTC)).astimezone(zone)
+    candidate = reference.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= reference:
+        # "resets 3pm" at 4pm means tomorrow's 3pm: a reset hint only ever
+        # points forward.
+        candidate += timedelta(days=1)
+    return ResetHint(
+        at=candidate.astimezone(UTC),
+        source=match.group(0).strip(),
+        confidence="exact" if zone is not None else "approximate",
+    )
 
 
 class ACPUsageLimitError(Exception):

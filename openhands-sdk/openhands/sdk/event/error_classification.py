@@ -72,7 +72,8 @@ def classify_error(code: str, detail: str = "") -> ErrorClassification:
         return _failure(FailureKind.QUOTA, user_action="settings")
     # An ACP runtime's subscription usage window is exhausted (ACPAgent
     # classifies the CLI's own notice); it clears with time or a fallback.
-    if code in {"ACPUsageLimit"}:
+    # ...ChainExhausted is the same outcome once every fallback is spent too.
+    if code in {"ACPUsageLimit", "ACPUsageLimitChainExhausted"}:
         return _failure(FailureKind.QUOTA, user_action="settings")
     if code in {
         "LLMBadRequestError",
