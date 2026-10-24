@@ -36,6 +36,7 @@ from openhands.sdk.utils.path import get_user_persistence_dir, resolves_within
 logger = get_logger(__name__)
 
 __all__ = [
+    "IDENTITY_BUDGET_CHARS",
     "IDENTITY_DIR_NAME",
     "IDENTITY_DOCUMENTS",
     "IdentityDocument",
@@ -45,11 +46,41 @@ __all__ = [
     "legacy_soul_path",
     "migrate_legacy_soul",
     "read_identity_document",
+    "read_identity_prompt",
     "read_identity_set",
     "write_identity_document",
 ]
 
 IDENTITY_DIR_NAME: Final[str] = "soul"
+
+#: How much of a prompt the identity may occupy, in characters.
+#:
+#: Identity is context, not the task. A set that has grown over months must not
+#: be able to crowd out what the agent was actually asked to do, so the budget
+#: is fixed here and spent in load order.
+IDENTITY_BUDGET_CHARS: Final[int] = 24000
+
+#: What each document may take of that budget, by id. Proportional to how much
+#: it changes what the work looks like.
+IDENTITY_DOCUMENT_BUDGET: Final[dict[str, int]] = {
+    "soul": 8000,
+    "style": 6000,
+    "memory": 6000,
+    "good-outputs": 2000,
+    "bad-outputs": 2000,
+    "influences": 2000,
+}
+
+#: Heading each document is given in a prompt. ``soul`` has none: it is the
+#: identity itself, and a heading above it would read as a section of
+#: something larger.
+IDENTITY_PROMPT_HEADINGS: Final[dict[str, str]] = {
+    "style": "How I write and work",
+    "memory": "What we have already established",
+    "good-outputs": "Work that sounds like me",
+    "bad-outputs": "Work that does not sound like me",
+    "influences": "What shaped my thinking",
+}
 
 #: Largest a single identity document may be, in characters.
 #:
@@ -245,3 +276,51 @@ def write_identity_document(document: IdentityDocument, content: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(path, content.strip() + "\n")
     return path
+
+
+def _trim(text: str, budget: int, *, keep_end: bool = False) -> str:
+    """``text`` cut to ``budget``, saying where it was cut.
+
+    ``keep_end`` keeps the tail, which is what a log wants: the most recent
+    thing learned is the one most likely to matter.
+    """
+    if len(text) <= budget:
+        return text
+    if keep_end:
+        return "[earlier entries omitted]\n\n" + text[-budget:]
+    return text[:budget] + "\n\n[truncated]"
+
+
+def read_identity_prompt() -> str | None:
+    """The whole identity as one block of prompt text, or ``None`` if empty.
+
+    Load order, within a budget: who the person is, then how they write, then
+    what has already been established, then calibration. A model that reads
+    the examples before it knows whose voice it is in has read them for
+    nothing.
+
+    A set with only ``SOUL.md`` renders exactly that document and nothing else,
+    which is what every install that predates the set has — so this reads the
+    same as the single file did until something more is written.
+    """
+    documents = read_identity_set()
+    if not documents:
+        return None
+
+    blocks: list[str] = []
+    spent = 0
+    for document in sorted(IDENTITY_DOCUMENTS, key=lambda item: item.order):
+        text = documents.get(document.name)
+        if text is None:
+            continue
+        room = min(
+            IDENTITY_DOCUMENT_BUDGET.get(document.name, 2000),
+            IDENTITY_BUDGET_CHARS - spent,
+        )
+        if room <= 0:
+            continue
+        trimmed = _trim(text, room, keep_end=document.name == "memory")
+        spent += len(trimmed)
+        heading = IDENTITY_PROMPT_HEADINGS.get(document.name)
+        blocks.append(trimmed if heading is None else f"## {heading}\n\n{trimmed}")
+    return "\n\n".join(blocks) or None

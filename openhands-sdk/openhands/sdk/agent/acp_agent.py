@@ -118,8 +118,8 @@ from openhands.sdk.agent.acp_usage_limit import (
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.agent.stream_context import StreamContext
 from openhands.sdk.context import AgentContext
+from openhands.sdk.context.identity import read_identity_prompt
 from openhands.sdk.context.prompts.section import PromptContext
-from openhands.sdk.context.soul import read_user_soul
 from openhands.sdk.conversation.state import ConversationExecutionStatus
 from openhands.sdk.credential import (
     CredentialBindingError,
@@ -2722,7 +2722,7 @@ class ACPAgent(AgentBase):
         """
         if PromptContext(template_kwargs=self.system_prompt_kwargs).persona:
             return None
-        return read_user_soul()
+        return read_identity_prompt()
 
     def _present_file_secret_names(self, state: ConversationState) -> set[str]:
         """Reserved file-content secret names supplied for this conversation.
