@@ -179,6 +179,8 @@ def test_acp_agent_settings_export_schema_has_acp_section() -> None:
         "acp_args",
         "acp_model",
         "acp_session_mode",
+        "acp_fallback_server",
+        "acp_fallback_model",
         "acp_prompt_timeout",
         "acp_startup_timeout",
     }
