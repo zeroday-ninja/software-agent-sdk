@@ -8,6 +8,7 @@ agent that silently says nothing.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -15,7 +16,12 @@ import pytest
 from openhands.sdk.acp_servers.antigravity import (
     AntigravityAgent,
     _tool_title,
+    _turn_failure,
     _user_message,
+)
+from openhands.sdk.agent.acp_usage_limit import (
+    parse_reset_hint,
+    text_indicates_usage_limit,
 )
 
 
@@ -83,6 +89,44 @@ RECORDED_TURN = [
 ]
 
 
+# Recorded from the same flags against an account whose weekly quota was
+# spent, 2026-10-24. The `error_message` step carries no text; the words are
+# on the result, and the status code is only ever on stderr.
+RECORDED_REFUSAL = [
+    {
+        "event": "step_update",
+        "step_update": {"step_index": 0, "state": "DONE", "step_type": "user_input"},
+    },
+    {
+        "event": "step_update",
+        "step_update": {"step_index": 1, "state": "DONE", "step_type": "error_message"},
+    },
+    {
+        "event": "result",
+        "result": {
+            "conversation_id": "879ba243",
+            "status": "ERROR",
+            "response": "",
+            "error": (
+                "Individual quota reached. Please upgrade your subscription to "
+                "increase your limits. Resets in 132h6m57s."
+            ),
+            "num_turns": 1,
+        },
+    },
+]
+
+RECORDED_STDERR = (
+    "error: Individual quota reached. Please upgrade your subscription to "
+    "increase your limits. Resets in 132h6m57s.\n"
+    'AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED (code 429): Individual '
+    "quota reached. Please upgrade your subscription to increase your limits. "
+    'Resets in 132h6m57s.","status":"RESOURCE_EXHAUSTED","error_code":429,'
+    '"code_kind":"http","retryable":true,'
+    '"error_id":"799feefc-c28c-464b-8260-9da757494384-1"}'
+)
+
+
 class RecordingConnection:
     """Collects what the adapter would have sent to a client."""
 
@@ -103,14 +147,17 @@ def agent() -> tuple[AntigravityAgent, RecordingConnection]:
 
 async def _replay(
     adapter: AntigravityAgent, events: list[dict], session_id: str = "s1"
-) -> str | None:
+) -> tuple[str | None, str | None]:
     session = adapter._sessions[session_id]  # noqa: SLF001 - the unit under test
     stop: str | None = None
+    failure: str | None = None
     for event in events:
-        reason = await adapter._handle(session, event)  # noqa: SLF001
+        reason, reported = await adapter._handle(session, event)  # noqa: SLF001
         if reason is not None:
             stop = reason
-    return stop
+        if reported is not None:
+            failure = reported
+    return stop, failure
 
 
 @pytest.mark.asyncio
@@ -122,7 +169,7 @@ async def test_a_recorded_turn_becomes_text_and_one_tool_call(agent) -> None:
     adapter._sessions["s1"].session_id = "s1"  # noqa: SLF001
 
     # Act
-    stop = await _replay(adapter, RECORDED_TURN)
+    stop, failure = await _replay(adapter, RECORDED_TURN)
 
     # Assert: the answer arrives as text, and the file write is announced once
     # and then completed — not twice, which would read as two writes.
@@ -131,10 +178,13 @@ async def test_a_recorded_turn_becomes_text_and_one_tool_call(agent) -> None:
     assert kinds.count("ToolCallStart") == 1
     assert kinds.count("ToolCallProgress") == 1
     assert stop == "end_turn"
+    assert failure is None
 
 
 @pytest.mark.asyncio
-async def test_an_error_result_is_reported_as_a_refusal(agent) -> None:
+async def test_a_refusal_is_reported_for_raising_not_streamed_as_an_answer(
+    agent,
+) -> None:
     # Arrange
     adapter, connection = agent
     await adapter.new_session(cwd="/tmp")
@@ -142,14 +192,48 @@ async def test_an_error_result_is_reported_as_a_refusal(agent) -> None:
     adapter._sessions["s1"].session_id = "s1"  # noqa: SLF001
 
     # Act
-    stop = await _replay(
+    stop, failure = await _replay(adapter, RECORDED_REFUSAL)
+
+    # Assert: the words come back to be raised, and nothing was streamed as
+    # agent text. A usage limit delivered as an answer finishes the turn
+    # successfully, and the conversation never fails over.
+    assert stop == "refusal"
+    assert failure is not None and "quota reached" in failure
+    assert connection.updates == []
+
+
+def test_a_refusal_reads_as_a_usage_limit_with_its_reset() -> None:
+    # Act: what `prompt` raises, assembled from both streams.
+    detail = _turn_failure(RECORDED_REFUSAL[-1]["result"]["error"], RECORDED_STDERR)
+
+    # Assert: the two facts the scheduler needs. The status code only ever
+    # appears on stderr, and the reset only in the sentence.
+    assert text_indicates_usage_limit(detail)
+    hint = parse_reset_hint(detail, now=datetime(2026, 10, 24, 8, 0, tzinfo=UTC))
+    assert hint.at == datetime(2026, 10, 24, 8, 0, tzinfo=UTC) + timedelta(
+        hours=132, minutes=6, seconds=57
+    )
+    assert hint.confidence == "exact"
+
+
+@pytest.mark.asyncio
+async def test_a_step_type_this_build_has_never_seen_is_reported(agent) -> None:
+    # Arrange
+    adapter, connection = agent
+    await adapter.new_session(cwd="/tmp")
+    adapter._sessions["s1"] = adapter._sessions.pop("antigravity-1")  # noqa: SLF001
+    adapter._sessions["s1"].session_id = "s1"  # noqa: SLF001
+
+    # Act
+    await _replay(
         adapter,
-        [{"event": "result", "result": {"status": "ERROR", "error": "no credits"}}],
+        [{"event": "step_update", "step_update": {"step_type": "plan_revision"}}],
     )
 
-    # Assert: the reason reaches the user rather than a turn that just ends.
-    assert stop == "refusal"
-    assert "no credits" in connection.updates[0].content.text
+    # Assert: a step type that grew is visible. `user_input` and
+    # `error_message` stay silent on purpose -- the first is our own prompt
+    # echoed back, the second is the prose half of the result event.
+    assert "plan_revision" in connection.updates[0].content.text
 
 
 @pytest.mark.asyncio

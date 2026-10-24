@@ -25,6 +25,21 @@ failing test rather than as an agent that silently says nothing:
                                                "tool_info":{"parameters":{…}}}}
          {"event":"result","result":{"status":"SUCCESS","response":"…","usage":{…}}}
 
+A refused turn, captured from an account whose weekly quota was spent:
+
+    out  {"event":"step_update","step_update":{"step_type":"error_message", …}}
+         {"event":"result","result":{"status":"ERROR","response":"",
+           "error":"Individual quota reached. … Resets in 132h6m57s."}}
+    err  AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED (code 429): …",
+           "status":"RESOURCE_EXHAUSTED","error_code":429,"retryable":true}
+
+The refusal rides out of ``prompt`` as an exception rather than as agent text,
+because that is the only path the SDK classifies: a usage limit delivered as
+an answer finishes the turn, and the conversation never fails over. The CLI
+states the reset as a duration, which is the most precise reset signal any
+runtime here gives, so the text is carried through verbatim for the parser --
+including the stderr line, which is where the status code lives.
+
 An event this build does not recognise is reported, never dropped: a silent
 drop is how a runtime ends up looking like it did nothing when it did
 something nobody can see.
@@ -53,7 +68,7 @@ from acp.schema import (
 )
 
 
-__all__ = ["AntigravityAgent", "main"]
+__all__ = ["AntigravityAgent", "AntigravityTurnError", "main"]
 
 #: Protocol version this server speaks.
 PROTOCOL_VERSION = 1
@@ -73,6 +88,59 @@ STREAM_FLAGS = (
 
 #: How long to wait for the CLI to exit after a cancel before killing it.
 CANCEL_GRACE_SECONDS = 5.0
+
+#: Step types this build knows about and deliberately says nothing for.
+#:
+#: ``user_input`` is the CLI echoing back the prompt we just sent it, and
+#: ``error_message`` is the prose half of a failure the ``result`` event
+#: reports properly. Anything *not* listed here is surfaced, so a step type
+#: the CLI grows is visible rather than dropped.
+IGNORED_STEP_TYPES = frozenset({"user_input", "error_message"})
+
+#: Longest stderr tail kept to describe a failure.
+MAX_STDERR_CHARS = 2000
+
+
+class AntigravityTurnError(RuntimeError):
+    """The CLI refused or failed the turn.
+
+    Raised out of :meth:`AntigravityAgent.prompt` rather than streamed as agent
+    text. The SDK reads a turn *error* to decide whether a runtime is out of
+    usage; the same words delivered as an answer finish the turn successfully
+    and no failover happens.
+    """
+
+
+async def _drain(stream: asyncio.StreamReader | None) -> str:
+    """Everything the CLI wrote to stderr, bounded."""
+    if stream is None:
+        return ""
+    data = await stream.read()
+    return data.decode("utf-8", errors="replace")[-MAX_STDERR_CHARS:].strip()
+
+
+def _turn_failure(reported: str, stderr_text: str) -> str:
+    """What the CLI said went wrong, in the words a classifier can read.
+
+    The stdout error is the sentence a person wants; the stderr line carries
+    the status and the code -- ``RESOURCE_EXHAUSTED (code 429)`` -- which is
+    what tells a usage limit apart from a crash. Both are kept, the readable
+    one first, because dropping either loses something no other line has.
+    """
+    detail = reported
+    for line in stderr_text.splitlines():
+        line = line.strip()
+        if not line.startswith("AGY_ERROR:"):
+            continue
+        try:
+            payload = json.loads(line[len("AGY_ERROR:") :].strip())
+        except json.JSONDecodeError:
+            continue
+        short = payload.get("short_error")
+        if isinstance(short, str) and short and short != reported:
+            detail = f"{detail} ({short})"
+        break
+    return detail
 
 
 def _binary() -> str:
@@ -186,17 +254,31 @@ class AntigravityAgent:
         await process.stdin.drain()
         process.stdin.close()
 
-        stop_reason = await self._pump(session, process)
-        await process.wait()
-        session.process = None
+        # Drained concurrently, for two reasons: an undrained pipe stops the
+        # CLI dead once the kernel buffer fills, and the status code for a
+        # refusal is only ever on stderr.
+        errors = asyncio.create_task(_drain(process.stderr))
+        try:
+            stop_reason, failure = await self._pump(session, process)
+        finally:
+            await process.wait()
+            session.process = None
+        stderr_text = await errors
+        if failure is not None and not session.cancelled:
+            raise AntigravityTurnError(_turn_failure(failure, stderr_text))
         return PromptResponse(stop_reason=stop_reason)
 
     async def _pump(
         self, session: _Session, process: asyncio.subprocess.Process
-    ) -> str:
-        """Translate the CLI's stream into session updates until it ends."""
+    ) -> tuple[str, str | None]:
+        """Translate the CLI's stream into session updates until it ends.
+
+        Returns the stop reason and, when the CLI reported one, the failure it
+        reported -- which the caller raises rather than streams.
+        """
         assert process.stdout is not None
         stop_reason = "end_turn"
+        failure: str | None = None
         while True:
             raw = await process.stdout.readline()
             if not raw:
@@ -212,34 +294,38 @@ class AntigravityAgent:
                 # build could not read.
                 await self._say(session, f"[unreadable output: {line[:200]}]")
                 continue
-            reason = await self._handle(session, event)
+            reason, reported = await self._handle(session, event)
             if reason is not None:
                 stop_reason = reason
+            if reported is not None:
+                failure = reported
         if session.cancelled:
-            return "cancelled"
-        return stop_reason
+            return "cancelled", None
+        return stop_reason, failure
 
-    async def _handle(self, session: _Session, event: dict) -> str | None:
-        """One stream event. Returns a stop reason when the turn ended."""
+    async def _handle(
+        self, session: _Session, event: dict
+    ) -> tuple[str | None, str | None]:
+        """One stream event.
+
+        Returns the stop reason when the turn ended, and the CLI's own words
+        when it reported a failure.
+        """
         kind = event.get("event")
         if kind == "init":
-            return None
+            return None, None
         if kind == "step_update":
             await self._step(session, event.get("step_update") or {})
-            return None
+            return None, None
         if kind == "result":
             result = event.get("result") or {}
             if result.get("status") == "ERROR":
-                await self._say(
-                    session,
-                    f"[antigravity error: {result.get('error') or 'unknown'}]",
-                )
-                return "refusal"
-            return "end_turn"
+                return "refusal", str(result.get("error") or "").strip() or "unknown"
+            return "end_turn", None
         # An event kind this build has never seen. Reported rather than
         # dropped: a format that grew should look like a format that grew.
         await self._say(session, f"[unrecognised event: {kind!r}]")
-        return None
+        return None, None
 
     async def _step(self, session: _Session, step: dict) -> None:
         step_type = step.get("step_type")
@@ -260,6 +346,8 @@ class AntigravityAgent:
                 )
             return
         if step_type != "tool":
+            if step_type not in IGNORED_STEP_TYPES:
+                await self._say(session, f"[unrecognised step: {step_type!r}]")
             return
 
         index = step.get("step_index")

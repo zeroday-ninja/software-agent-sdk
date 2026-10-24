@@ -56,6 +56,9 @@ USAGE_LIMIT_MARKERS: tuple[str, ...] = (
     "credits_depleted",
     "quota exceeded",
     "exceeded your current quota",
+    # antigravity, verbatim: "Individual quota reached. Please upgrade your
+    # subscription to increase your limits. Resets in 132h6m57s."
+    "quota reached",
     # generic
     "rate limit",
     "rate_limit",
@@ -177,6 +180,85 @@ def _named_zone(name: str | None) -> ZoneInfo | None:
         return None
 
 
+# Antigravity states the reset as a duration instead of a clock time:
+# "RESOURCE_EXHAUSTED (code 429): Individual quota reached ... Resets in
+# 132h9m47s." A duration needs no zone and no next-occurrence rule, so it is
+# the most precise reset any of these runtimes gives -- read first for that
+# reason. Both the compact form and spelled-out units are accepted, because
+# the compact one is what the CLI prints and the other is what a notice
+# written for a human says.
+# Longest alternative first, so "hours" is not read as "h" with a stray
+# "ours" left over. The unit ends on "not a letter" rather than on a word
+# boundary: the compact form packs units against the next number
+# ("132h9m47s"), where there is no boundary between "h" and "9", while
+# "3 months" is still rejected because "m" is followed by a letter.
+_UNIT_PATTERN = (
+    r"days|day|d|hours|hour|hrs|hr|h|minutes|minute|mins|min|m"
+    r"|seconds|second|secs|sec|s"
+)
+
+_RESET_IN_RE = re.compile(
+    rf"""reset(?:s|ting)?\s+in\s+
+        (?P<body>
+          (?:\d+\s*(?:{_UNIT_PATTERN})(?![a-z])[\s,]*)+
+        )""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_DURATION_UNIT_RE = re.compile(
+    rf"(\d+)\s*({_UNIT_PATTERN})(?![a-z])",
+    re.IGNORECASE,
+)
+
+_UNIT_SECONDS = {
+    "d": 86400,
+    "day": 86400,
+    "days": 86400,
+    "h": 3600,
+    "hr": 3600,
+    "hrs": 3600,
+    "hour": 3600,
+    "hours": 3600,
+    "m": 60,
+    "min": 60,
+    "mins": 60,
+    "minute": 60,
+    "minutes": 60,
+    "s": 1,
+    "sec": 1,
+    "secs": 1,
+    "second": 1,
+    "seconds": 1,
+}
+
+#: Longest reset a notice can state before it is treated as unreadable. A
+#: month ahead is not a usage window reopening; it is a parse that went wrong,
+#: and acting on it would park a runtime for weeks.
+_MAX_RESET_AHEAD = timedelta(days=31)
+
+
+def _parse_reset_in(text: str, reference: datetime) -> ResetHint | None:
+    """A reset stated as a duration from now, or ``None`` when there is none."""
+    match = _RESET_IN_RE.search(text)
+    if match is None:
+        return None
+    seconds = 0
+    for amount, unit in _DURATION_UNIT_RE.findall(match.group("body")):
+        seconds += int(amount) * _UNIT_SECONDS[unit.lower()]
+    if seconds <= 0:
+        return None
+    ahead = timedelta(seconds=seconds)
+    if ahead > _MAX_RESET_AHEAD:
+        return None
+    return ResetHint(
+        at=(reference + ahead).astimezone(UTC),
+        source=" ".join(match.group(0).split()),
+        # A duration is anchored to the instant it was read, so there is no
+        # zone to be wrong about.
+        confidence="exact",
+    )
+
+
 def parse_reset_hint(text: str | None, *, now: datetime | None = None) -> ResetHint:
     """Read the reset time out of a usage-limit notice.
 
@@ -189,6 +271,9 @@ def parse_reset_hint(text: str | None, *, now: datetime | None = None) -> ResetH
     """
     if not text:
         return ResetHint()
+    relative = _parse_reset_in(text, now or datetime.now(UTC))
+    if relative is not None:
+        return relative
     match = _RESET_TIME_RE.search(text)
     if match is None:
         return ResetHint()

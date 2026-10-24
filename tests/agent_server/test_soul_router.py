@@ -153,9 +153,7 @@ def test_the_set_lists_every_document_in_the_order_a_prompt_reads_them(
     assert response.status_code == 200
     names = [document["name"] for document in response.json()["documents"]]
     assert names[:3] == ["soul", "style", "memory"]
-    assert all(
-        document["exists"] is False for document in response.json()["documents"]
-    )
+    assert all(document["exists"] is False for document in response.json()["documents"])
 
 
 def test_writing_a_document_and_clearing_it_again(client: TestClient) -> None:
@@ -242,9 +240,7 @@ def test_memory_merges_from_another_backend_without_losing_an_entry(
     assert "mem-bbb" in body["content"]
 
     # Act: the same sync again, which is what a periodic sync does.
-    again = client.post(
-        "/api/soul/documents/memory/merge", json={"logs": [elsewhere]}
-    )
+    again = client.post("/api/soul/documents/memory/merge", json={"logs": [elsewhere]})
 
     # Assert: converged. Running a sync twice must not grow the log.
     assert again.json()["entry_count"] == 2
