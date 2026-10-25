@@ -83,6 +83,35 @@ def test_merging_is_idempotent() -> None:
     assert twice == once
 
 
+def test_a_conflict_converges_and_then_stays_put() -> None:
+    """The claim this format rests on, for the case that nearly broke it.
+
+    Convergence was covered for logs that agree and never for logs that do
+    not. Two backends merged the same pair of logs in opposite orders and
+    filed the same two bodies under swapped ids, so they held different
+    documents — and when they then synced *with each other*, each body
+    arrived under an id the other side had never seen. The conflict doubled
+    every round: three syncs, four copies of one memory.
+    """
+    # Arrange: the same entry, with two different bodies.
+    edited = LOG_A.replace("not attested", "attested by nobody")
+
+    # Act: both directions, then the two results syncing with each other.
+    one_way = format_memory_log(merge_memory_logs(LOG_A, edited).entries)
+    other_way = format_memory_log(merge_memory_logs(edited, LOG_A).entries)
+    after = format_memory_log(merge_memory_logs(one_way, other_way).entries)
+
+    # Assert: the same document whichever order it happened in, and a further
+    # sync between them changes nothing.
+    assert one_way == other_way
+    assert after == one_way
+    # Neither version keeps the ambiguous id: an id carrying two bodies
+    # identifies neither of them, and awarding it to whichever arrived first
+    # is what made the two documents differ.
+    assert "<!-- id: mem-aaa -->" not in after
+    assert after.count("<!-- id: mem-aaa-") == 2
+
+
 def test_one_id_with_two_bodies_is_kept_twice_and_reported() -> None:
     # Arrange: history was edited somewhere, which this format says does not
     # happen.

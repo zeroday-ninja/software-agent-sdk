@@ -85,6 +85,19 @@ def derive_entry_id(timestamp: str, title: str, body: str) -> str:
     return f"mem-{digest[:_DERIVED_ID_CHARS]}"
 
 
+def _conflict_id(entry: MemoryEntry) -> str:
+    """Where a body that clashes with its id is filed instead.
+
+    Derived from the body rather than counted, so both backends reach the same
+    answer whichever order they see the two versions in. Keeps the original id
+    as a prefix: a person reading their own log needs to see that these two
+    entries are the same memory told twice, and `conflicts` names the id they
+    came from so the panel can point at it.
+    """
+    derived = derive_entry_id(entry.timestamp, entry.title, entry.body)
+    return f"{entry.id}-{derived.removeprefix('mem-')}"
+
+
 def _normalize_timestamp(raw: str) -> str:
     """An ISO instant, or the epoch when the heading's date is unreadable.
 
@@ -165,9 +178,20 @@ def merge_memory_logs(*logs: str) -> MemoryMerge:
 
     Nothing is overwritten and nothing is dropped. An entry present in one log
     and not another is kept; an entry in both is kept once. An id carrying two
-    different bodies is kept twice, under suffixed ids, and reported — because
+    different bodies is kept twice, under derived ids, and reported — because
     the alternative is deciding on the user's behalf which version of their own
     memory to throw away.
+
+    A conflict's ids are a function of the bodies, never of arrival order,
+    and the ambiguous id is kept by neither version. Both of the obvious
+    choices fail to converge: a counter made two backends that merged the same
+    pair of logs in opposite orders file the same two bodies under swapped
+    ids — and when they then synced with each other each body arrived under an
+    id the other had never seen, so the conflict *doubled* every round.
+    Deriving the suffix from the body stopped the doubling but left the bare
+    id with whichever version arrived first, so the two documents still
+    differed. Moving both is what makes the union idempotent, which is the
+    claim this whole format rests on.
     """
     merged: dict[str, MemoryEntry] = {}
     conflicts: list[str] = []
@@ -184,15 +208,26 @@ def merge_memory_logs(*logs: str) -> MemoryMerge:
                     merged[entry.id] = entry
                 continue
             conflicts.append(entry.id)
-            suffix = 2
-            while f"{entry.id}-{suffix}" in merged:
-                suffix += 1
-            merged[f"{entry.id}-{suffix}"] = MemoryEntry(
-                id=f"{entry.id}-{suffix}",
-                timestamp=entry.timestamp,
-                title=entry.title,
-                body=entry.body,
-            )
+            # An id carrying two different bodies is ambiguous, so neither
+            # body keeps it: both move to an id derived from their own text.
+            # Awarding the bare id to whichever arrived first is what left two
+            # backends holding different documents after merging the same two
+            # logs in opposite orders.
+            merged.pop(entry.id, None)
+            for version in (seen, entry):
+                kept = _conflict_id(version)
+                # Already there means this exact body has been filed under its
+                # own id before, which is what makes a second sync a no-op
+                # rather than another copy.
+                merged.setdefault(
+                    kept,
+                    MemoryEntry(
+                        id=kept,
+                        timestamp=version.timestamp,
+                        title=version.title,
+                        body=version.body,
+                    ),
+                )
     return MemoryMerge(
         entries=sorted(merged.values(), key=MemoryEntry.sort_key),
         conflicts=sorted(set(conflicts)),
