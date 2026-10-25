@@ -210,6 +210,42 @@ def test_a_soul_written_before_the_set_existed_moves_into_it_on_first_write(
     assert not (persistence_dir / "SOUL.md").exists()
 
 
+def test_a_merge_keeps_what_the_person_wrote_above_the_log(
+    client: TestClient,
+) -> None:
+    """The merge rewrites the whole file, so the hand-written part must survive.
+
+    Filing one correction goes through this route, so dropping the preamble
+    made a single thumbs-down enough to delete the title a person had put on
+    their own memory. The incoming log's preamble stays where it was written:
+    two of them is the three-way merge this format exists to avoid.
+    """
+    # Arrange
+    here = (
+        "# What I keep forgetting\n\n"
+        "## 2026-10-20T08:00:00Z — Judge on a second runtime\n"
+        "<!-- id: mem-aaa -->\n\nSelf-attestation is not attestation.\n"
+    )
+    client.put("/api/soul/documents/memory", json={"content": here})
+    elsewhere = (
+        "# Another machine's title\n\n"
+        "## 2026-10-21T09:00:00Z — Fork, never upstream\n"
+        "<!-- id: mem-bbb -->\n\nUpstream is not ours to push to.\n"
+    )
+
+    # Act
+    response = client.post(
+        "/api/soul/documents/memory/merge", json={"logs": [elsewhere]}
+    )
+
+    # Assert
+    assert response.status_code == 200
+    content = response.json()["content"]
+    assert content.startswith("# What I keep forgetting\n\n")
+    assert "Another machine's title" not in content
+    assert response.json()["entry_count"] == 2
+
+
 def test_memory_merges_from_another_backend_without_losing_an_entry(
     client: TestClient,
 ) -> None:

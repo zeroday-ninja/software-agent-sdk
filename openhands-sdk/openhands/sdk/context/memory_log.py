@@ -114,14 +114,32 @@ def _normalize_timestamp(raw: str) -> str:
     return parsed.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def memory_log_preamble(text: str) -> str:
+    """Whatever a person wrote above the first entry, including its blank line.
+
+    A title, or a sentence saying what the file is for. It is not an entry and
+    no merge can reconcile two of them — that is the three-way merge this
+    format exists to avoid — so a merge keeps the *target's* and leaves every
+    incoming one where it was written. Dropping it instead was a silent
+    deletion of the only part of this file a person writes by hand, and
+    filing one correction was enough to do it.
+
+    `""` when the log starts with its first entry, which is the usual case.
+    """
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if _HEADING.match(line.rstrip("\n")) is not None:
+            return "".join(lines[:index])
+    # No heading at all: every line is preamble, and a log with none is a file
+    # whose entries have yet to be written rather than one with nothing in it.
+    return text
+
+
 def parse_memory_log(text: str) -> list[MemoryEntry]:
     """Every entry in a log, in the order they appear.
 
-    Anything before the first entry heading — a title, a paragraph explaining
-    what the file is — is not an entry and is not returned. It is also not
-    preserved by :func:`format_memory_log`, which is deliberate: the file is a
-    log, and a merge that had to reconcile two different preambles would be
-    exactly the three-way merge this format exists to avoid.
+    Anything before the first entry heading is not an entry and is not
+    returned; :func:`memory_log_preamble` is how a caller keeps it.
     """
     entries: list[MemoryEntry] = []
     timestamp: str | None = None
