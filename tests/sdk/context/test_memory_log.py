@@ -2,6 +2,7 @@
 
 from openhands.sdk.context.memory_log import (
     format_memory_log,
+    memory_log_preamble,
     merge_memory_logs,
     parse_memory_log,
 )
@@ -126,3 +127,35 @@ def test_one_id_with_two_bodies_is_kept_twice_and_reported() -> None:
     bodies = [entry.body for entry in merged.entries]
     assert any("not attested" in body for body in bodies)
     assert any("attested by nobody" in body for body in bodies)
+
+
+def test_the_part_a_person_wrote_by_hand_is_readable() -> None:
+    """A merge rewrites the whole file, so the preamble has to survive it.
+
+    Whatever is above the first entry — a title, a sentence saying what the
+    file is for — is the only part of this log a person writes by hand, and
+    nothing could read it back. Filing one correction goes through the merge,
+    so dropping it was a silent deletion on the first thumbs-down.
+    """
+    assert memory_log_preamble(LOG_A) == "# Memory\n\n"
+    # A log that starts with its first entry has none, which is the usual case.
+    assert memory_log_preamble(LOG_B) == ""
+    # And a file with no entries yet is all preamble rather than nothing.
+    assert memory_log_preamble("# Memory\n\nNothing yet.\n") == (
+        "# Memory\n\nNothing yet.\n"
+    )
+
+
+def test_a_merge_that_keeps_the_preamble_still_converges() -> None:
+    # The preamble is local to each machine and the entries are the union, so
+    # merging twice changes nothing — which is the property the whole format
+    # rests on.
+    once = memory_log_preamble(LOG_A) + format_memory_log(
+        merge_memory_logs(LOG_A, LOG_B).entries
+    )
+    twice = memory_log_preamble(once) + format_memory_log(
+        merge_memory_logs(once, LOG_B).entries
+    )
+
+    assert once.startswith("# Memory\n\n")
+    assert twice == once

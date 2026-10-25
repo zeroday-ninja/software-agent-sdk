@@ -27,6 +27,7 @@ from openhands.sdk.context.identity import (
 )
 from openhands.sdk.context.memory_log import (
     format_memory_log,
+    memory_log_preamble,
     merge_memory_logs,
 )
 from openhands.sdk.context.soul import (
@@ -267,7 +268,12 @@ def merge_memory(request: MemoryMergeRequest) -> MemoryMergeResponse:
     document = _require_document("memory")
     before = read_identity_document(document) or ""
     merged = merge_memory_logs(before, *request.logs)
-    content = format_memory_log(merged.entries)
+    # The target's own preamble, kept. Whatever a person wrote above the first
+    # entry is the only part of this file they write by hand, and the merge
+    # rewrites the whole thing — so dropping it made filing one correction
+    # enough to delete it. An incoming log's preamble stays on the machine it
+    # was written on: two of them is the three-way merge this format avoids.
+    content = memory_log_preamble(before) + format_memory_log(merged.entries)
     write_identity_document(document, content)
     existing = len(merge_memory_logs(before).entries)
     return MemoryMergeResponse(
