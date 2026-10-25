@@ -15,6 +15,7 @@ import pytest
 
 from openhands.sdk.context.identity import (
     IDENTITY_BUDGET_CHARS,
+    IDENTITY_DOCUMENT_BUDGET,
     IdentityDocument,
     known_identity_document,
     write_identity_document,
@@ -162,6 +163,37 @@ def test_identity_stays_inside_its_budget(
     # Assert: identity is context and the task is the task.
     assert len(rendered) <= IDENTITY_BUDGET_CHARS + 500
     assert "[truncated]" in rendered
+
+
+def test_no_one_document_crowds_out_the_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What the per-document budgets are *for*.
+
+    The test above it asserts the aggregate, and the aggregate alone is
+    satisfied by a single document eating all of it: drop the per-document
+    ceiling and a 40000-character SOUL.md fills the whole 24000, leaving
+    STYLE and MEMORY out of the prompt entirely while the total still checks
+    out. The budgets are "proportional to how much it changes what the work
+    looks like", and that proportion is the thing nothing was holding.
+    """
+    # Arrange: three documents, each far past its own slot.
+    monkeypatch.setenv("OH_PERSISTENCE_DIR", str(tmp_path))
+    identity = tmp_path / "soul"
+    identity.mkdir(parents=True)
+    (identity / "SOUL.md").write_text("S" * 40000)
+    (identity / "STYLE.md").write_text("T" * 40000)
+    (identity / "MEMORY.md").write_text("M" * 40000)
+
+    # Act
+    rendered = load_soul()
+
+    # Assert: all three are in the prompt, and the first one took roughly its
+    # own budget rather than the whole of it.
+    assert "S" * 100 in rendered
+    assert "T" * 100 in rendered
+    assert "M" * 100 in rendered
+    assert rendered.count("S") <= IDENTITY_DOCUMENT_BUDGET["soul"] + 100
 
 
 def test_a_long_memory_keeps_what_was_learned_most_recently(
