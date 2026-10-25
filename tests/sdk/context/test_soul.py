@@ -13,7 +13,12 @@ from pathlib import Path
 
 import pytest
 
-from openhands.sdk.context.identity import IDENTITY_BUDGET_CHARS
+from openhands.sdk.context.identity import (
+    IDENTITY_BUDGET_CHARS,
+    IdentityDocument,
+    known_identity_document,
+    write_identity_document,
+)
 from openhands.sdk.context.soul import (
     DEFAULT_SOUL,
     get_soul_path,
@@ -174,3 +179,52 @@ def test_a_long_memory_keeps_what_was_learned_most_recently(
     # Assert: the oldest thing someone learned is rarely the most relevant.
     assert "learned this today" in rendered
     assert "earlier entries omitted" in rendered
+
+
+def test_a_document_that_would_escape_the_identity_directory_is_refused(
+    soul_path: Path,
+) -> None:
+    """The guard that had never been exercised.
+
+    No live surface can reach it: a document is resolved by name from a closed
+    declared set, so no caller's string ever becomes a path. What it protects
+    against is a *declared* document whose relative path escapes — a mistake
+    made in this file, not an attacker's input — and its own docstring says
+    so: "which a declared document's relative path should never do but is
+    cheap to refuse rather than to trust".
+
+    Cheap to refuse, and it was free to believe. Nothing in the tree asserted
+    the refusal, so a declared path with a `..` in it would have written
+    wherever it pointed.
+    """
+    # Arrange: a document shaped exactly like a real one, aimed outside.
+    escaping = IdentityDocument(
+        name="escaping",
+        relative_path="../../outside.md",
+        purpose="Not a real document.",
+        order=99,
+    )
+    outside = soul_path.parent.parent / "outside.md"
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="outside the identity directory"):
+        write_identity_document(escaping, "should never be written")
+    assert not outside.exists()
+
+
+def test_a_declared_document_writes_where_it_says(soul_path: Path) -> None:
+    """The other half, so the guard cannot be satisfied by refusing everything.
+
+    `examples/good-outputs.md` is a real declared document with a path
+    separator in it, which is the case a careless guard would reject.
+    """
+    # Arrange
+    examples = known_identity_document("good-outputs")
+    assert examples is not None
+
+    # Act
+    written = write_identity_document(examples, "Work that sounds like them.")
+
+    # Assert
+    assert written.read_text().strip() == "Work that sounds like them."
+    assert written.parent.name == "examples"
