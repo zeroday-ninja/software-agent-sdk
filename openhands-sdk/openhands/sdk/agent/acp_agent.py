@@ -1170,6 +1170,7 @@ _ACP_AUTH_ERROR_MARKERS: tuple[str, ...] = (
     "invalid x-api-key",
     "expired",
     "please run /login",
+    "not logged in",
     "authentication required",
     "oauth token",
     "credential",

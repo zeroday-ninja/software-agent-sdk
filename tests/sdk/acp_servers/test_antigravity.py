@@ -14,11 +14,17 @@ from typing import Any
 import pytest
 
 from openhands.sdk.acp_servers.antigravity import (
+    AGY_BINARY_ENV,
     AntigravityAgent,
+    AntigravityUnavailable,
+    _sign_in_detail,
+    _signed_out,
     _tool_title,
     _turn_failure,
+    _unavailable_detail,
     _user_message,
 )
+from openhands.sdk.agent.acp_agent import _classify_acp_turn_error
 from openhands.sdk.agent.acp_usage_limit import (
     parse_reset_hint,
     text_indicates_usage_limit,
@@ -276,3 +282,91 @@ def test_a_tool_call_reads_as_one_line() -> None:
         "write_file: /tmp/x"
     )
     assert _tool_title("run_command", {}) == "run_command"
+
+
+class TestWhenTheCliCannotRunAtAll:
+    """Two failures that are not the model answering badly.
+
+    `FileNotFoundError: [Errno 2] No such file or directory: 'agy'` is what a
+    sandbox produced, and it is true and useless: it names a binary nobody
+    chose and gives no next step. "You are not logged into Antigravity"
+    arrives as an ordinary turn failure and reads like the model declining.
+    Both are the runtime not being reachable, and both are fixed by a person
+    doing something specific.
+    """
+
+    def test_a_missing_cli_says_what_is_missing_and_how_to_point_at_it(self) -> None:
+        # Arrange / Act
+        detail = _unavailable_detail(
+            "agy", FileNotFoundError(2, "No such file or directory")
+        )
+
+        # Assert: the binary, why a sandbox would not have it, and the way out.
+        assert "not installed here" in detail
+        assert "npm ACP providers" in detail
+        assert AGY_BINARY_ENV in detail
+
+    def test_a_cli_that_cannot_be_executed_is_told_apart_from_a_missing_one(
+        self,
+    ) -> None:
+        # A binary that is present and not executable is a different morning's
+        # work from one that was never installed.
+        detail = _unavailable_detail("/opt/agy", PermissionError(13, "Denied"))
+
+        assert "not executable" in detail
+        assert "not installed" not in detail
+
+    def test_the_sign_in_message_names_the_sandbox_as_the_thing_to_sign_in(
+        self,
+    ) -> None:
+        # The login lives in the desktop keyring, which a sandbox has not got,
+        # so "sign in" without saying *where* sends somebody to sign in again
+        # on the machine that already is.
+        detail = _sign_in_detail("agy")
+
+        assert "keyring" in detail
+        assert "sandbox" in detail
+        # And in the wording the SDK's turn classifier reads as an auth
+        # condition, so a client is offered the fix rather than a generic
+        # prompt failure.
+        assert _classify_acp_turn_error(AntigravityUnavailable(detail)) == (
+            "ACPAuthRequired"
+        )
+
+    def test_a_missing_cli_is_not_reported_as_an_auth_problem(self) -> None:
+        # Nothing is wrong with anybody's credentials; the tool is not there.
+        # Offering re-authentication would send somebody to fix the one thing
+        # that is already fine.
+        detail = _unavailable_detail("agy", FileNotFoundError(2, "nope"))
+
+        assert _classify_acp_turn_error(AntigravityUnavailable(detail)) == (
+            "ACPPromptError"
+        )
+
+    def test_a_signed_out_cli_is_recognised_from_either_stream(self) -> None:
+        # The CLI says it on stdout as a refusal and on stderr as a log line,
+        # and which one arrives depends on how far it got.
+        assert _signed_out("Error: Please sign in to view available models.")
+        assert _signed_out(
+            "error getting token source: You are not logged into Antigravity."
+        )
+        # Not everything mentioning a sign-in is one: a usage limit is a
+        # different answer and must still fail over as a turn error.
+        assert not _signed_out("Individual quota reached. Resets in 121h4m23s.")
+        assert not _signed_out("")
+
+    @pytest.mark.asyncio
+    async def test_a_missing_cli_is_raised_rather_than_answered(
+        self, agent, monkeypatch
+    ) -> None:
+        # Raised, not streamed: the SDK reads a turn *error* to decide whether
+        # to fail over, and the same words as an answer would end the turn
+        # successfully with nothing having happened.
+        adapter, _connection = agent
+        monkeypatch.setenv(AGY_BINARY_ENV, "/nonexistent/agy-for-this-test")
+        await adapter.new_session(cwd="/tmp")
+
+        with pytest.raises(AntigravityUnavailable) as raised:
+            await adapter.prompt("antigravity-1", [{"type": "text", "text": "hello"}])
+
+        assert "not installed here" in str(raised.value)

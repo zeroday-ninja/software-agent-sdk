@@ -111,6 +111,63 @@ class AntigravityTurnError(RuntimeError):
     """
 
 
+class AntigravityUnavailable(RuntimeError):
+    """The CLI cannot run here at all, which is not a failed turn.
+
+    Separate from :class:`AntigravityTurnError` because it means something
+    different and is fixed differently: a turn error is the runtime answering
+    badly, this is the runtime not being reachable. Failing over to another
+    runtime is right for both, but only one of them is worth telling somebody
+    how to repair.
+    """
+
+
+#: What the CLI says when it has never been signed in. Matched on the stable
+#: half of the sentence: the second clause names a command that has already
+#: changed shape once.
+_NOT_SIGNED_IN = ("not logged into antigravity", "please sign in")
+
+
+def _signed_out(text: str) -> bool:
+    """Whether this failure is "nobody has signed this machine in"."""
+    lowered = (text or "").casefold()
+    return any(marker in lowered for marker in _NOT_SIGNED_IN)
+
+
+def _unavailable_detail(binary: str, error: OSError) -> str:
+    """Why the CLI could not be started, and what to do about it.
+
+    `FileNotFoundError: [Errno 2] No such file or directory: 'agy'` is true
+    and useless: it names a binary nobody chose and no next step. The sandbox
+    case is the common one -- the image carries the npm-installed providers
+    and Antigravity is a native download that is not among them.
+    """
+    if isinstance(error, FileNotFoundError):
+        return (
+            f"The Antigravity CLI ({binary!r}) is not installed here. It is a "
+            "native binary rather than one of the npm ACP providers the "
+            "sandbox image carries, so a sandbox does not have it unless it "
+            f"was put there. Set {AGY_BINARY_ENV} to its path, or choose "
+            "another runtime."
+        )
+    if isinstance(error, PermissionError):
+        return f"The Antigravity CLI at {binary!r} is not executable by this user."
+    return f"The Antigravity CLI at {binary!r} could not be started: {error}"
+
+
+def _sign_in_detail(binary: str) -> str:
+    """What to do about a CLI that is installed and signed out."""
+    # "not logged in" is deliberate wording: the SDK's turn classifier reads
+    # it as an auth condition, which is what lets a client offer to fix it
+    # instead of reporting a generic prompt failure.
+    return (
+        "Antigravity is installed here but it is not logged in. Its login "
+        "lives in the desktop keyring, which a sandbox does not have, so a "
+        f"sandbox needs its own: run {binary!r} once in that environment and "
+        "complete the Google sign-in. Until then this runtime cannot answer."
+    )
+
+
 async def _drain(stream: asyncio.StreamReader | None) -> str:
     """Everything the CLI wrote to stderr, bounded."""
     if stream is None:
@@ -240,13 +297,21 @@ class AntigravityAgent:
         if os.environ.get("OH_ANTIGRAVITY_AUTO_APPROVE", "1") == "1":
             command.append("--dangerously-skip-permissions")
 
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            cwd=session.cwd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=session.cwd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as error:
+            # Raised, not streamed: the SDK reads a turn error to decide
+            # whether to fail over, and the same words as an answer would end
+            # the turn successfully with nothing having happened.
+            raise AntigravityUnavailable(
+                _unavailable_detail(command[0], error)
+            ) from error
         session.process = process
 
         assert process.stdin is not None
@@ -264,7 +329,14 @@ class AntigravityAgent:
             await process.wait()
             session.process = None
         stderr_text = await errors
-        if failure is not None and not session.cancelled:
+        if session.cancelled:
+            return PromptResponse(stop_reason=stop_reason)
+        # Checked before the general case: "not logged in" arrives as an
+        # ordinary turn failure, and reported as one it reads like the model
+        # declining rather than like a machine nobody has set up.
+        if _signed_out(f"{failure or ''}\n{stderr_text}"):
+            raise AntigravityUnavailable(_sign_in_detail(command[0]))
+        if failure is not None:
             raise AntigravityTurnError(_turn_failure(failure, stderr_text))
         return PromptResponse(stop_reason=stop_reason)
 
