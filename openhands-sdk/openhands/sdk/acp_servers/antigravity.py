@@ -396,7 +396,7 @@ class AntigravityAgent:
             return "end_turn", None
         # An event kind this build has never seen. Reported rather than
         # dropped: a format that grew should look like a format that grew.
-        await self._say(session, f"[unrecognised event: {kind!r}]")
+        await self._unrecognised(session, "event", kind)
         return None, None
 
     async def _step(self, session: _Session, step: dict) -> None:
@@ -419,7 +419,7 @@ class AntigravityAgent:
             return
         if step_type != "tool":
             if step_type not in IGNORED_STEP_TYPES:
-                await self._say(session, f"[unrecognised step: {step_type!r}]")
+                await self._unrecognised(session, "step", step_type)
             return
 
         index = step.get("step_index")
@@ -450,13 +450,43 @@ class AntigravityAgent:
             ),
         )
 
-    async def _say(self, session: _Session, text: str) -> None:
+    async def _say(
+        self, session: _Session, text: str, meta: dict | None = None
+    ) -> None:
         await self._update(
             session,
             AgentMessageChunk(
                 session_update="agent_message_chunk",
                 content=_text(text),
+                field_meta=meta,
             ),
+        )
+
+    async def _unrecognised(self, session: _Session, what: str, kind: Any) -> None:
+        """Something this build has never seen, as a field and as a sentence.
+
+        The milestone this adapter belongs to asks for "any unrecognised event
+        surfaced as a *typed error* rather than dropped", and the execution
+        rule beside it is blunter: anything a machine must act on is a typed
+        field, never buried in a sentence. The sentence was all there was — it
+        landed in the assistant's own message stream, where nothing can count
+        it and nothing can tell it from the model's words.
+
+        So the fact goes in the protocol's own extension slot, where a reader
+        can find it by key, and the sentence stays for the person watching the
+        transcript. A format that grew should look like a format that grew to
+        both of them.
+        """
+        await self._say(
+            session,
+            f"[unrecognised {what}: {kind!r}]",
+            meta={
+                "openhands.unrecognised": {
+                    "what": what,
+                    "kind": None if kind is None else str(kind),
+                    "adapter": "antigravity",
+                }
+            },
         )
 
     async def _update(self, session: _Session, update: Any) -> None:
