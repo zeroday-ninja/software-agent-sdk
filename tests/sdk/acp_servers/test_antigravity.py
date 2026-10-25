@@ -240,6 +240,13 @@ async def test_a_step_type_this_build_has_never_seen_is_reported(agent) -> None:
     # `error_message` stay silent on purpose -- the first is our own prompt
     # echoed back, the second is the prose half of the result event.
     assert "plan_revision" in connection.updates[0].content.text
+    assert connection.updates[0].field_meta == {
+        "openhands.unrecognised": {
+            "what": "step",
+            "kind": "plan_revision",
+            "adapter": "antigravity",
+        }
+    }
 
 
 @pytest.mark.asyncio
@@ -256,6 +263,17 @@ async def test_an_event_this_build_has_never_seen_is_reported(agent) -> None:
     # Assert: a format that grew should look like a format that grew, not like
     # a runtime that said nothing.
     assert "plan_update" in connection.updates[0].content.text
+    # And as a field, not only a sentence. The milestone asks for "any
+    # unrecognised event surfaced as a typed error rather than dropped", and
+    # a line in the assistant's own message stream is something nothing can
+    # count and nothing can tell from the model's words.
+    assert connection.updates[0].field_meta == {
+        "openhands.unrecognised": {
+            "what": "event",
+            "kind": "plan_update",
+            "adapter": "antigravity",
+        }
+    }
 
 
 def test_a_prompt_becomes_the_input_message_the_cli_accepts() -> None:
