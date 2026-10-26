@@ -1,3 +1,4 @@
+from openhands.sdk.event.acp_adapter_incident import ACPAdapterIncidentEvent
 from openhands.sdk.event.acp_runtime_switch import (
     ACPRuntimeSwitchEvent,
     ACPRuntimeSwitchReason,
@@ -34,6 +35,7 @@ from openhands.sdk.event.user_action import InterruptEvent, PauseEvent
 
 
 __all__ = [
+    "ACPAdapterIncidentEvent",
     "ACPRuntimeSwitchEvent",
     "ACPRuntimeSwitchReason",
     "ACPToolCallEvent",

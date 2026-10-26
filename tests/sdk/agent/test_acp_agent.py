@@ -1397,6 +1397,80 @@ class TestACPToolCallProgressCollapse:
     """
 
     @pytest.mark.asyncio
+    async def test_an_adapter_incident_is_a_typed_event_not_only_a_sentence(
+        self,
+    ) -> None:
+        """An adapter marks a chunk it could not translate in ``_meta``; the
+        bridge relays that as ``ACPAdapterIncidentEvent`` and keeps the text."""
+        from acp.schema import AgentMessageChunk, TextContentBlock
+
+        from openhands.sdk.event import ACPAdapterIncidentEvent
+
+        client = _OpenHandsACPBridge()
+        events: list[Any] = []
+        client.on_event = events.append
+
+        await client.session_update(
+            "s1",
+            AgentMessageChunk(
+                session_update="agent_message_chunk",
+                content=TextContentBlock(
+                    type="text", text="[unrecognised step: 'review_note']"
+                ),
+                field_meta={
+                    "openhands.unrecognised": {
+                        "what": "step",
+                        "kind": "review_note",
+                        "adapter": "antigravity",
+                    }
+                },
+            ),
+        )
+        # An ordinary chunk carries no mark and raises no incident.
+        await client.session_update(
+            "s1",
+            AgentMessageChunk(
+                session_update="agent_message_chunk",
+                content=TextContentBlock(type="text", text=" and on we go"),
+            ),
+        )
+
+        assert "".join(client.accumulated_text) == (
+            "[unrecognised step: 'review_note'] and on we go"
+        )
+        assert len(events) == 1
+        incident = events[0]
+        assert isinstance(incident, ACPAdapterIncidentEvent)
+        assert incident.adapter == "antigravity"
+        assert incident.what == "step"
+        assert incident.unrecognised_kind == "review_note"
+        assert incident.detail == "[unrecognised step: 'review_note']"
+        assert incident.source == "environment"
+        # It survives the round trip every persisted event makes.
+        restored = ACPAdapterIncidentEvent.model_validate_json(
+            incident.model_dump_json()
+        )
+        assert restored == incident
+
+    @pytest.mark.asyncio
+    async def test_an_incident_with_no_sink_is_not_an_error(self) -> None:
+        from acp.schema import AgentMessageChunk, TextContentBlock
+
+        client = _OpenHandsACPBridge()
+        client.on_event = None
+
+        await client.session_update(
+            "s1",
+            AgentMessageChunk(
+                session_update="agent_message_chunk",
+                content=TextContentBlock(type="text", text="[unrecognised event: 'x']"),
+                field_meta={"openhands.unrecognised": {"what": "event", "kind": "x"}},
+            ),
+        )
+
+        assert client.accumulated_text == ["[unrecognised event: 'x']"]
+
+    @pytest.mark.asyncio
     async def test_tool_call_start_emits_started_event(self) -> None:
         client = _OpenHandsACPBridge()
         events: list[Any] = []
