@@ -14,6 +14,7 @@ from openhands.sdk.conversation.visualizer.base import (
     ConversationVisualizerBase,
 )
 from openhands.sdk.event import (
+    ACPAdapterIncidentEvent,
     ACPRuntimeSwitchEvent,
     ACPToolCallEvent,
     ActionEvent,
@@ -210,6 +211,10 @@ def _get_message_color(event: Event) -> str:
 EVENT_VISUALIZATION_CONFIG: dict[type[Event], EventVisualizationConfig] = {
     ACPRuntimeSwitchEvent: EventVisualizationConfig(
         title="ACP Runtime Switch",
+        color=_SYSTEM_COLOR,
+    ),
+    ACPAdapterIncidentEvent: EventVisualizationConfig(
+        title="ACP Adapter Incident",
         color=_SYSTEM_COLOR,
     ),
     ACPToolCallEvent: EventVisualizationConfig(

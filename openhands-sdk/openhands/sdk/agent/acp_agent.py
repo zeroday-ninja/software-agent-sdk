@@ -127,12 +127,14 @@ from openhands.sdk.credential import (
     VersionedCredentialBinding,
 )
 from openhands.sdk.event import (
+    ACPAdapterIncidentEvent,
     ACPToolCallEvent,
     ActionEvent,
     MessageEvent,
     ObservationEvent,
     SystemPromptEvent,
 )
+from openhands.sdk.event.acp_adapter_incident import unrecognised_incident
 from openhands.sdk.event.conversation_error import ConversationErrorEvent
 from openhands.sdk.llm import LLM, ImageContent, Message, MessageToolCall, TextContent
 from openhands.sdk.logger import get_logger
@@ -1536,6 +1538,7 @@ class _OpenHandsACPBridge:
             return
 
         if isinstance(update, AgentMessageChunk):
+            text = ""
             if isinstance(update.content, TextContentBlock):
                 # Mask once, then use the masked chunk for both the persisted
                 # accumulation and the live ``on_token`` relay. A secret split
@@ -1549,6 +1552,18 @@ class _OpenHandsACPBridge:
                         self.on_token(text)
                     except Exception:
                         logger.debug("on_token callback failed", exc_info=True)
+            # An adapter that met something it has no translation for marks
+            # the chunk in the protocol's extension slot. That mark used to end
+            # here — the text was kept and the field let go — so a typed error
+            # on the wire was an untyped sentence in the conversation. It is a
+            # typed event now, emitted live like a tool call.
+            # ``getattr``: a chunk from an older protocol package, or a test's
+            # narrower stand-in, may not carry the extension slot at all.
+            incident = unrecognised_incident(
+                getattr(update, "field_meta", None), detail=text
+            )
+            if incident is not None:
+                self._emit_adapter_incident(incident)
             self._maybe_signal_activity()
         elif isinstance(update, AgentThoughtChunk):
             if isinstance(update.content, TextContentBlock):
@@ -1660,6 +1675,20 @@ class _OpenHandsACPBridge:
                 is_error=tc.get("status") == "failed",
             )
             self.on_event(event)
+        except Exception:
+            logger.debug("on_event callback failed", exc_info=True)
+
+    def _emit_adapter_incident(self, incident: dict[str, Any]) -> None:
+        """Relay an adapter's incident report as its own event, live.
+
+        Guarded like the tool-call relay: a sink that is gone or that raises
+        must not take the turn down with it, because the incident is already
+        in the assistant's text and the turn is otherwise fine.
+        """
+        if self.on_event is None:
+            return
+        try:
+            self.on_event(ACPAdapterIncidentEvent(**incident))
         except Exception:
             logger.debug("on_event callback failed", exc_info=True)
 
