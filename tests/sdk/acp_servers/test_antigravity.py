@@ -276,6 +276,36 @@ async def test_an_event_this_build_has_never_seen_is_reported(agent) -> None:
     }
 
 
+@pytest.mark.asyncio
+async def test_a_grown_format_is_said_once_not_once_per_step(agent) -> None:
+    """Seven identical notices in one turn read as an error loop.
+
+    A user's transcript carried `[unrecognised step: 'system_message']` seven
+    times over, and the answer underneath it. The fact is a field now and the
+    sentence is for a person -- and a person needs to hear it once.
+    """
+    adapter, connection = agent
+    await adapter.new_session(cwd="/tmp")
+    adapter._sessions["s1"] = adapter._sessions.pop("antigravity-1")  # noqa: SLF001
+    adapter._sessions["s1"].session_id = "s1"  # noqa: SLF001
+
+    await _replay(
+        adapter,
+        [
+            {"event": "step_update", "step_update": {"step_type": "plan_revision"}},
+            {"event": "step_update", "step_update": {"step_type": "plan_revision"}},
+            {"event": "step_update", "step_update": {"step_type": "plan_revision"}},
+            # And the CLI's own scaffolding is not a grown format at all.
+            {"event": "step_update", "step_update": {"step_type": "system_message"}},
+            {"event": "step_update", "step_update": {"step_type": "system_message"}},
+        ],
+    )
+
+    notices = [u for u in connection.updates if "unrecognised" in u.content.text]
+    assert len(notices) == 1
+    assert "plan_revision" in notices[0].content.text
+
+
 def test_a_prompt_becomes_the_input_message_the_cli_accepts() -> None:
     # Act
     message = _user_message([{"type": "text", "text": "hello"}])

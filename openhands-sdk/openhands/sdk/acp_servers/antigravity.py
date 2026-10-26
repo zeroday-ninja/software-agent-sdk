@@ -91,11 +91,15 @@ CANCEL_GRACE_SECONDS = 5.0
 
 #: Step types this build knows about and deliberately says nothing for.
 #:
-#: ``user_input`` is the CLI echoing back the prompt we just sent it, and
+#: ``user_input`` is the CLI echoing back the prompt we just sent it,
 #: ``error_message`` is the prose half of a failure the ``result`` event
-#: reports properly. Anything *not* listed here is surfaced, so a step type
-#: the CLI grows is visible rather than dropped.
-IGNORED_STEP_TYPES = frozenset({"user_input", "error_message"})
+#: reports properly, and ``system_message`` is the CLI's own scaffolding --
+#: the instructions it feeds its model, which are not the model's words and
+#: not the user's. Seen seven times in one live turn, each surfaced as
+#: ``[unrecognised step: 'system_message']`` in the transcript. Anything *not*
+#: listed here is surfaced, so a step type the CLI grows is visible rather
+#: than dropped.
+IGNORED_STEP_TYPES = frozenset({"user_input", "error_message", "system_message"})
 
 #: Longest stderr tail kept to describe a failure.
 MAX_STDERR_CHARS = 2000
@@ -222,6 +226,9 @@ class _Session:
     process: asyncio.subprocess.Process | None = None
     #: Step indices already announced, so a progress update is not a new call.
     announced_tools: set[int] = field(default_factory=set)
+    #: (what, kind) pairs already reported as unrecognised, so a format that
+    #: grew is said once per session rather than once per step.
+    unrecognised_seen: set[tuple[str, str]] = field(default_factory=set)
     cancelled: bool = False
 
 
@@ -475,8 +482,13 @@ class AntigravityAgent:
         So the fact goes in the protocol's own extension slot, where a reader
         can find it by key, and the sentence stays for the person watching the
         transcript. A format that grew should look like a format that grew to
-        both of them.
+        both of them -- once. Said on every step of the turn it read as an
+        error loop rather than a notice, and buried the answer under it.
         """
+        key = (what, str(kind))
+        if key in session.unrecognised_seen:
+            return
+        session.unrecognised_seen.add(key)
         await self._say(
             session,
             f"[unrecognised {what}: {kind!r}]",
