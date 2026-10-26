@@ -179,6 +179,7 @@ def classify_error(code: str, detail: str = "") -> ErrorClassification:
         "LLMServiceUnavailableError",
         "LLMTimeoutError",
         "ReadTimeout",
+        "ACPConnectionLost",
         "LLMNoResponseError",
         "MCPTimeoutError",
         "BadGatewayError",

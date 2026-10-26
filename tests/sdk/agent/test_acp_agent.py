@@ -3722,6 +3722,81 @@ class TestACPAgentCleanup:
         assert agent_ref() is None
         assert callback() is None
 
+    def test_a_lost_connection_says_what_the_adapter_came_to(self, tmp_path):
+        """ "Connection closed" was five failed cycles in one night with nothing
+        to read afterwards. The error now quotes the adapter's exit and its
+        last stderr lines, and raises the same incident a bad stream does."""
+        from collections import deque
+        from types import SimpleNamespace
+
+        from openhands.sdk.event import ACPAdapterIncidentEvent
+        from openhands.sdk.event.error_classification import (
+            FailureKind,
+            classify_error,
+        )
+
+        agent = _make_agent()
+        state = _make_state(tmp_path)
+        client = _OpenHandsACPBridge()
+        agent._client = client
+        agent._process = SimpleNamespace(returncode=137)
+        agent._stderr_tail = deque(
+            [
+                "AGY_ADAPTER_CRASH: Traceback (most recent call last):",
+                "ValueError: boom",
+            ]
+        )
+        events: list = []
+
+        agent._emit_turn_error(
+            ConnectionError("Connection closed"), state, events.append
+        )
+
+        error = next(e for e in events if isinstance(e, ConversationErrorEvent))
+        assert error.code == "ACPConnectionLost"
+        assert "exited with code 137" in error.detail
+        assert "ValueError: boom" in error.detail
+        incident = next(e for e in events if isinstance(e, ACPAdapterIncidentEvent))
+        assert incident.what == "process"
+        assert incident.adapter == "custom"
+        assert "137" in incident.detail
+        # A lost connection is something to retry, not a misconfiguration.
+        assert classify_error("ACPConnectionLost").kind == FailureKind.TRANSIENT
+        agent.release_runtime()
+
+    def test_an_adapter_that_is_still_running_is_said_to_be(self, tmp_path):
+        agent = _make_agent()
+        state = _make_state(tmp_path)
+        agent._client = _OpenHandsACPBridge()
+        events: list = []
+
+        agent._emit_turn_error(
+            ConnectionError("Connection closed"), state, events.append
+        )
+
+        error = next(e for e in events if isinstance(e, ConversationErrorEvent))
+        assert "still running" in error.detail
+        assert "wrote nothing to stderr" in error.detail
+        agent.release_runtime()
+
+    @pytest.mark.asyncio
+    async def test_the_stderr_relay_keeps_only_the_last_lines(self):
+        from collections import deque
+
+        class Lines:
+            def __init__(self, lines):
+                self._lines = [line.encode() for line in lines]
+
+            async def readline(self):
+                return self._lines.pop(0) if self._lines else b""
+
+        tail: deque[str] = deque(maxlen=3)
+        await _log_acp_subprocess_stderr(
+            Lines([f"line {i}\n" for i in range(6)] + ["\n"]), tail
+        )
+
+        assert list(tail) == ["line 3", "line 4", "line 5"]
+
     def test_turn_error_survives_credential_tracking_failure(self, tmp_path):
         agent = _make_agent()
         state = _make_state(tmp_path)

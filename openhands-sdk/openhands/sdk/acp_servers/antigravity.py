@@ -104,6 +104,13 @@ IGNORED_STEP_TYPES = frozenset({"user_input", "error_message", "system_message"}
 #: Longest stderr tail kept to describe a failure.
 MAX_STDERR_CHARS = 2000
 
+#: Longest line accepted from the CLI's stream. One event is one line, and a
+#: tool's whole output rides inside it — a test suite's, a listing of a home
+#: directory's — so asyncio's 64 KiB default was a ceiling a long turn was
+#: bound to hit, and hitting it raised out of the reader with the CLI still
+#: writing to a pipe nobody read.
+STREAM_LINE_LIMIT = 32 * 1024 * 1024
+
 
 class AntigravityTurnError(RuntimeError):
     """The CLI refused or failed the turn.
@@ -178,6 +185,15 @@ async def _drain(stream: asyncio.StreamReader | None) -> str:
         return ""
     data = await stream.read()
     return data.decode("utf-8", errors="replace")[-MAX_STDERR_CHARS:].strip()
+
+
+def _adapter_failure(error: BaseException, stderr_text: str) -> str:
+    """A failure of this adapter's own reading, in words a person can act on."""
+    detail = f"adapter failure: {type(error).__name__}: {error}"
+    tail = stderr_text.strip().splitlines()[-3:]
+    if tail:
+        detail += " | stderr: " + " / ".join(line.strip() for line in tail)
+    return detail
 
 
 def _turn_failure(reported: str, stderr_text: str) -> str:
@@ -311,6 +327,7 @@ class AntigravityAgent:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=STREAM_LINE_LIMIT,
             )
         except OSError as error:
             # Raised, not streamed: the SDK reads a turn error to decide
@@ -332,6 +349,16 @@ class AntigravityAgent:
         errors = asyncio.create_task(_drain(process.stderr))
         try:
             stop_reason, failure = await self._pump(session, process)
+        except Exception as error:
+            # The stream could not be read — a line past the limit, a shape
+            # the translation choked on. The CLI is still running, blocked on
+            # a pipe nobody reads now, so it is ended first or the wait below
+            # never returns; then the failure is raised with its own words and
+            # the CLI's, as a turn error the SDK can read, rather than letting
+            # it take the adapter down and leave "Connection closed" behind.
+            await self._terminate(session)
+            stderr_text = await errors
+            raise AntigravityTurnError(_adapter_failure(error, stderr_text)) from error
         finally:
             await process.wait()
             session.process = None
@@ -558,10 +585,26 @@ def _tool_title(name: str, info: dict) -> str:
 
 
 def main() -> None:
-    """Run the adapter over stdio."""
-    asyncio.run(
-        run_agent(AntigravityAgent(model=os.environ.get("OH_ANTIGRAVITY_MODEL")))
-    )
+    """Run the adapter over stdio.
+
+    A crash is named on stderr before the process goes: the SDK keeps the
+    adapter's last stderr lines and quotes them in the conversation's error,
+    which is the only place they survive once the sandbox is deleted.
+    """
+    try:
+        asyncio.run(
+            run_agent(AntigravityAgent(model=os.environ.get("OH_ANTIGRAVITY_MODEL")))
+        )
+    except BaseException as error:  # noqa: BLE001 - the last words, then exit
+        import traceback
+
+        sys.stderr.write(
+            "AGY_ADAPTER_CRASH: "
+            + "".join(traceback.format_exception(error)).strip()[-1500:]
+            + "\n"
+        )
+        sys.stderr.flush()
+        raise
 
 
 if __name__ == "__main__":  # pragma: no cover - module entry point

@@ -12,10 +12,13 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from acp.schema import TextContentBlock
 
+from openhands.sdk.acp_servers import antigravity
 from openhands.sdk.acp_servers.antigravity import (
     AGY_BINARY_ENV,
     AntigravityAgent,
+    AntigravityTurnError,
     AntigravityUnavailable,
     _sign_in_detail,
     _signed_out,
@@ -164,6 +167,90 @@ async def _replay(
         if reported is not None:
             failure = reported
     return stop, failure
+
+
+FAKE_CLI = """#!/usr/bin/env python3
+import json, os, sys, time
+sys.stdin.read()
+def line(obj):
+    sys.stdout.write(json.dumps(obj) + "\\n"); sys.stdout.flush()
+line({"event": "init", "init": {"model": "fake"}})
+size = int(os.environ.get("FAKE_AGY_TEXT", "300000"))
+line({"event": "step_update", "step_update": {"step_index": 1, "state": "ACTIVE",
+      "step_type": "agent_response", "text_delta": "x" * size}})
+if os.environ.get("FAKE_AGY_LINGER"):
+    time.sleep(30)
+line({"event": "result", "result": {"status": "SUCCESS", "response": "ok"}})
+"""
+
+
+def _fake_cli(tmp_path, monkeypatch) -> None:
+    script = tmp_path / "agy"
+    script.write_text(FAKE_CLI)
+    script.chmod(0o755)
+    monkeypatch.setenv(AGY_BINARY_ENV, str(script))
+
+
+@pytest.mark.asyncio
+async def test_a_long_line_from_the_cli_is_read_rather_than_fatal(
+    agent, tmp_path, monkeypatch
+) -> None:
+    # Arrange: one event is one line, and a tool's whole output rides in it.
+    # 300 KB is an ordinary test run; asyncio's default ceiling was 64 KB.
+    _fake_cli(tmp_path, monkeypatch)
+    adapter, connection = agent
+    await adapter.new_session(cwd=str(tmp_path))
+
+    # Act
+    response = await adapter.prompt(
+        "antigravity-1", [TextContentBlock(type="text", text="go")]
+    )
+
+    # Assert
+    assert response.stop_reason == "end_turn"
+    texts = [u.content.text for u in connection.updates if hasattr(u, "content")]
+    assert any(len(text) == 300000 for text in texts)
+
+
+@pytest.mark.asyncio
+async def test_a_line_past_the_limit_is_a_turn_error_not_a_dead_adapter(
+    agent, tmp_path, monkeypatch
+) -> None:
+    # Arrange: a line this build cannot read, from a CLI that then lingers —
+    # which is what left the adapter hanging on a pipe nobody read.
+    _fake_cli(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_AGY_TEXT", "20000")
+    monkeypatch.setenv("FAKE_AGY_LINGER", "1")
+    monkeypatch.setattr(antigravity, "STREAM_LINE_LIMIT", 4096)
+    adapter, _connection = agent
+    await adapter.new_session(cwd=str(tmp_path))
+    session = adapter._sessions["antigravity-1"]  # noqa: SLF001
+
+    # Act
+    started = datetime.now(UTC)
+    with pytest.raises(AntigravityTurnError, match="adapter failure"):
+        await adapter.prompt(
+            "antigravity-1", [TextContentBlock(type="text", text="go")]
+        )
+
+    # Assert: the CLI was ended rather than waited on, and the turn failed
+    # with words, in time, instead of the adapter dying.
+    assert datetime.now(UTC) - started < timedelta(seconds=20)
+    assert session.process is None
+
+
+def test_a_crash_is_named_on_stderr_before_the_adapter_goes(
+    monkeypatch, capsys
+) -> None:
+    async def boom(*_args, **_kwargs):
+        raise RuntimeError("the loop fell over")
+
+    monkeypatch.setattr(antigravity, "run_agent", boom)
+
+    with pytest.raises(RuntimeError, match="fell over"):
+        antigravity.main()
+
+    assert "AGY_ADAPTER_CRASH:" in capsys.readouterr().err
 
 
 @pytest.mark.asyncio

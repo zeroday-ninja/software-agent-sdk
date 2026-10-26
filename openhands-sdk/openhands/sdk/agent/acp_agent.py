@@ -27,6 +27,7 @@ import threading
 import time
 import uuid
 import weakref
+from collections import deque
 from collections.abc import (
     Awaitable,
     Callable,
@@ -1143,18 +1144,43 @@ async def _filter_jsonrpc_lines(source: Any, dest: Any) -> None:
         dest.feed_eof()
 
 
-async def _log_acp_subprocess_stderr(source: Any) -> None:
+#: The event detail cap `_acp_error_detail` applies, shared by the death note.
+_ACP_ERROR_DETAIL_CHARS = 500
+
+#: How many of the adapter's last stderr lines are kept to explain a death.
+_ACP_STDERR_TAIL_LINES = 8
+#: How much of each kept line.
+_ACP_STDERR_TAIL_LINE_CHARS = 200
+
+
+async def _log_acp_subprocess_stderr(
+    source: Any, tail: deque[str] | None = None
+) -> None:
+    """Relay the adapter's stderr to the log, and keep the last few lines.
+
+    The log line is all there used to be, and it lives in a sandbox that is
+    deleted when the run ends — so when an adapter died mid-turn the
+    conversation recorded "Connection closed" and nothing else. The tail is
+    what the error event quotes instead.
+    """
     try:
         while line := await source.readline():
-            logger.info(
-                "ACP stderr: %s",
-                maybe_truncate(
-                    redact_text_secrets(line.decode(errors="replace").rstrip()),
-                    truncate_after=_ACP_SUBPROCESS_LOG_LINE_CHARS,
-                ),
+            text = maybe_truncate(
+                redact_text_secrets(line.decode(errors="replace").rstrip()),
+                truncate_after=_ACP_SUBPROCESS_LOG_LINE_CHARS,
             )
+            logger.info("ACP stderr: %s", text)
+            if tail is not None and text.strip():
+                tail.append(text[:_ACP_STDERR_TAIL_LINE_CHARS])
     except Exception:
         logger.debug("_log_acp_subprocess_stderr stopped", exc_info=True)
+
+
+def _connection_lost(exc: BaseException) -> bool:
+    """True when the adapter's stdio connection went away mid-turn."""
+    return isinstance(exc, ConnectionError) or "connection closed" in (
+        _acp_error_text(exc)
+    )
 
 
 # Substrings that mark a generic ``-32603 Internal error`` as really a credential
@@ -1311,6 +1337,8 @@ def _classify_acp_turn_error(exc: BaseException) -> str:
         return "ACPUsageLimit"
     if _acp_error_indicates_auth(exc):
         return "ACPAuthRequired"
+    if _connection_lost(exc):
+        return "ACPConnectionLost"
     return "ACPPromptError"
 
 
@@ -2047,6 +2075,7 @@ class ACPAgent(AgentBase):
     _filtered_reader: Any = PrivateAttr(default=None)  # StreamReader
     _stdout_filter_task: Any = PrivateAttr(default=None)  # asyncio.Task
     _stderr_log_task: Any = PrivateAttr(default=None)  # asyncio.Task
+    _stderr_tail: Any = PrivateAttr(default=None)  # deque[str] of last lines
     _closed: bool = PrivateAttr(default=False)
     _working_dir: str = PrivateAttr(default="")
     # The MCP servers the session was created with, and whether the server
@@ -3332,8 +3361,9 @@ class ACPAgent(AgentBase):
             stdout_filter_task = asyncio.get_event_loop().create_task(
                 _filter_jsonrpc_lines(process.stdout, filtered_reader)
             )
+            stderr_tail: deque[str] = deque(maxlen=_ACP_STDERR_TAIL_LINES)
             stderr_log_task = asyncio.get_event_loop().create_task(
-                _log_acp_subprocess_stderr(process.stderr)
+                _log_acp_subprocess_stderr(process.stderr, stderr_tail)
             )
 
             conn = _ACPClientConnection(
@@ -3354,6 +3384,7 @@ class ACPAgent(AgentBase):
             self._filtered_reader = filtered_reader
             self._stdout_filter_task = stdout_filter_task
             self._stderr_log_task = stderr_log_task
+            self._stderr_tail = stderr_tail
 
             # Initialize the protocol and discover server identity
             init_response = await conn.initialize(protocol_version=1)
@@ -4176,6 +4207,22 @@ class ACPAgent(AgentBase):
             _acp_error_detail(exc, state.secret_registry), acp_server=self.acp_server
         )
 
+    def _adapter_death_note(self) -> str:
+        """What became of the adapter process, and its last stderr lines."""
+        process = self._process
+        code = getattr(process, "returncode", None) if process is not None else None
+        name = self.acp_server or "custom"
+        if code is None:
+            came_to = f"the {name} adapter is still running but its connection closed"
+        elif code < 0:
+            came_to = f"the {name} adapter was killed by signal {-code}"
+        else:
+            came_to = f"the {name} adapter exited with code {code}"
+        tail = list(self._stderr_tail or [])
+        if not tail:
+            return f"{came_to}; it wrote nothing to stderr"
+        return f"{came_to}; last stderr: " + " | ".join(tail)
+
     def _emit_turn_error(
         self,
         exc: BaseException,
@@ -4192,12 +4239,27 @@ class ACPAgent(AgentBase):
                 "Failed to track ACP credentials during error handling",
             )
         error_detail = _acp_error_detail(effective_exc, state.secret_registry)
+        incident: ACPAdapterIncidentEvent | None = None
+        if _connection_lost(effective_exc):
+            # The adapter's stdio went away under the turn. Say what the
+            # process came to and quote its last words: "Connection closed"
+            # on its own was five failed cycles in one night with nothing to
+            # read afterwards, because the sandbox and its log were gone.
+            note = self._adapter_death_note()
+            error_detail = f"{error_detail} — {note}"[:_ACP_ERROR_DETAIL_CHARS]
+            incident = ACPAdapterIncidentEvent(
+                adapter=self.acp_server or "custom",
+                what="process",
+                detail=note[:_ACP_ERROR_DETAIL_CHARS],
+            )
         logger.error(
             "ACP prompt failed (%s): %s",
             type(effective_exc).__name__,
             error_detail,
         )
         self._cancel_inflight_tool_calls()
+        if incident is not None:
+            on_event(incident)
         # Emit error as an agent message (preserved for consumers that
         # inspect MessageEvents).
         on_event(
